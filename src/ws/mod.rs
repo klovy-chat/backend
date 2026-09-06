@@ -1,8 +1,8 @@
 // mod.rs
-// Handshake WS: origin, TLS, IP, klient, JWT, whitelist, crypto token.
+// Handshake WS: origin, TLS, IP, klient, JWT, crypto token.
 // Zakres:
 //  - pętla gniazda, heartbeat, cap połączeń
-//  - handshake: origin, TLS, IP, klient, JWT, whitelist, crypto
+//  - handshake: origin, TLS, IP, klient, JWT, crypto
 // Nowy warunek odrzucenia: log + ten sam powód co HTTP gdy się da.
 // Przy zmianach: ws/handlers.rs, ws/registry.rs, middlewares/client.rs.
 
@@ -45,15 +45,11 @@ use crate::utils::voice::calls::take_sessions_for_connection;
 use crate::ws::registry::ConnectionRegistry;
 use crate::ws::state::{is_valid_object_id, SocketState};
 use crate::middlewares::auth::TokenPayload;
-use crate::model::users::User;
 use crate::utils::auth::jwt::{
     jwt_decoding_key, parse_jwt_from_cookie_header, parse_refresh_from_cookie_header,
     resolve_session_family_id, user_from_jwt_with_refresh, JwtUserError,
 };
 use crate::utils::auth::validation::hs256_validation;
-use crate::utils::db::get_db;
-use crate::utils::whitelist::is_whitelist_enabled;
-use mongodb::bson::oid::ObjectId;
 
 #[derive(Clone)]
 pub struct WsAppState {
@@ -169,25 +165,6 @@ pub async fn ws_handler(
     if user_id.is_empty() || jwt_token.is_empty() || !is_valid_object_id(&user_id) {
         log::warn!("WebSocket rejected — missing or invalid JWT cookie");
         return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
-    }
-
-    if is_whitelist_enabled() {
-        let allowed = match ObjectId::parse_str(&user_id) {
-            Ok(oid) => match User::find_by_id(&get_db(), oid).await {
-                Ok(Some(u)) => u.is_whitelisted,
-                Ok(None) => false,
-                Err(_) => {
-                    log::warn!("WebSocket rejected — whitelist lookup unavailable");
-                    return (StatusCode::SERVICE_UNAVAILABLE, "Temporarily unavailable")
-                        .into_response();
-                }
-            },
-            Err(_) => false,
-        };
-        if !allowed {
-            log::warn!("WebSocket rejected — user {} not whitelisted", user_id);
-            return (StatusCode::FORBIDDEN, "User not whitelisted").into_response();
-        }
     }
 
     let session_family_id = if let Ok(key) = jwt_decoding_key() {
@@ -382,21 +359,6 @@ async fn handle_socket(
                         Err(JwtUserError::Denied) => {
                             registry.disconnect_user(&user_id).await;
                             return;
-                        }
-                    }
-                    if is_whitelist_enabled() {
-                        let still_allowed = match ObjectId::parse_str(&user_id) {
-                            Ok(oid) => match User::find_by_id(&get_db(), oid).await {
-                                Ok(Some(u)) => u.is_whitelisted,
-                                Ok(None) => false,
-
-                                Err(_) => return,
-                            },
-                            Err(_) => false,
-                        };
-                        if !still_allowed {
-                            log::info!("WebSocket closed — whitelist revoked for {}", user_id);
-                            registry.disconnect_user(&user_id).await;
                         }
                     }
                 });

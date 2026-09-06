@@ -16,7 +16,6 @@ pub mod origin;
 pub mod signup;
 pub mod captcha;
 pub mod validation;
-pub mod whitelist;
 
 use actix_web::dev::Payload;
 use actix_web::web::{Bytes, BytesMut};

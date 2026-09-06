@@ -34,4 +34,3 @@ pub mod unread;
 pub mod user;
 pub mod validators;
 pub mod voice;
-pub mod whitelist;

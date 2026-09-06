@@ -26,7 +26,6 @@ use crate::utils::messages::{
 };
 use crate::utils::messages::escape_regex;
 use crate::utils::user::json::resolve_display_name;
-use crate::utils::whitelist::is_whitelist_enabled;
 
 const MIN_SEARCH_LENGTH: usize = 3;
 const MAX_SEARCH_LENGTH: usize = 64;
@@ -73,7 +72,7 @@ async fn search_users_by_term(
 ) -> Option<Vec<User>> {
     let escaped = escape_regex(term);
 
-    let mut filter = doc! {
+    let filter = doc! {
         "_id": { "$ne": exclude },
         "isActive": { "$ne": false },
         "isBlocked": { "$ne": true },
@@ -85,9 +84,6 @@ async fn search_users_by_term(
             { "displayName": { "$regex": format!("^{escaped}"), "$options": "i" } },
         ],
     };
-    if is_whitelist_enabled() {
-        filter.insert("isWhitelisted", true);
-    }
 
     match User::collection(db)
         .find(filter)

@@ -1,8 +1,8 @@
 // users.rs
-// Dokument użytkownika: credentials, profil, 2FA, whitelist, status, język.
+// Dokument użytkownika: credentials, profil, 2FA, status, język.
 // Zakres:
 //  - hash hasła, flagi usunięcia/disable
-//  - credentials, profil, 2FA, whitelist, status; hash nie w JSON
+//  - credentials, profil, 2FA, status; hash nie w JSON
 // Nigdy nie serializuj hash/sekretów w JSON publicznym (user/json.rs).
 // Przy zmianach: controllers/auth.rs, utils/user/json.rs.
 
@@ -17,7 +17,6 @@ use crate::utils::crypto::passwords::{
     hash_user_password, is_stored_password_hash, verify_user_password,
 };
 use crate::utils::validators::username::{is_valid_username, normalize_username};
-use crate::utils::whitelist::is_whitelist_enabled;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -88,9 +87,6 @@ pub struct User {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub color: Option<i32>,
-
-    #[serde(rename = "isWhitelisted", default)]
-    pub is_whitelisted: bool,
 
     #[serde(rename = "isActive")]
     pub is_active: bool,
@@ -270,7 +266,6 @@ impl User {
         };
 
         let now = DateTime::now();
-        let whitelist_enabled = is_whitelist_enabled();
         let user = User {
             id: None,
             username,
@@ -281,7 +276,6 @@ impl User {
             banner: None,
             profile_setup: false,
             color: None,
-            is_whitelisted: !whitelist_enabled,
             is_active: true,
             is_blocked: false,
             is_banned: false,

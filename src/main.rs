@@ -93,16 +93,6 @@ async fn main() -> std::io::Result<()> {
         _ => {}
     }
 
-    match klovy_chat_server::utils::admin::reconcile_whitelist_fields(&mongodb_db).await {
-        Ok(legacy) if legacy > 0 => {
-            log::info!(
-                "Startup whitelist reconcile: approved {legacy} legacy account(s)"
-            );
-        }
-        Err(e) => log::warn!("Startup whitelist reconcile failed: {e}"),
-        _ => {}
-    }
-
     match klovy_chat_server::utils::admin::process_scheduled_deletions(&mongodb_db).await {
         Ok(deleted) if deleted > 0 => {
             log::info!("Startup: auto-deleted {deleted} scheduled user account(s)");
@@ -185,14 +175,7 @@ async fn main() -> std::io::Result<()> {
         Err(e) => log::warn!("Startup attachment reconcile failed: {e}"),
     }
 
-    log::info!(
-        "Klovy Chat server startup (whitelist: {})",
-        if klovy_chat_server::utils::whitelist::is_whitelist_enabled() {
-            "enabled"
-        } else {
-            "disabled"
-        }
-    );
+    log::info!("Klovy Chat server startup");
     server::run_server().await
 }
 

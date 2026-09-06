@@ -35,7 +35,7 @@ Publiczny ruch wchodzi na Axum (CORS, proxy, limity). Wewnętrzne API i upgrade 
 - WebSocket: obecność, typing, szyfrowane ramki
 - Głos (LiveKit)
 - Upload na Cloudflare R2 + skan ClamAV
-- Whitelist i limity rejestracji, Cloudflare Turnstile
+- Limity rejestracji, Cloudflare Turnstile
 - GIF-y i stickery (Giphy)
 
 ---

@@ -22,25 +22,9 @@ use crate::model::refresh_tokens::RefreshToken;
 use crate::model::users::User;
 use crate::model::warnings::Warning;
 use crate::utils::storage::{avatar_key_owned_by_channel, storage};
-use crate::utils::whitelist::is_whitelist_enabled;
 use crate::ws::registry::disconnect_user;
 
 pub const DELETION_GRACE_DAYS: i64 = 7;
-
-pub async fn reconcile_whitelist_fields(db: &Database) -> Result<u64, mongodb::error::Error> {
-    if !is_whitelist_enabled() {
-        return Ok(0);
-    }
-
-    let legacy = User::collection(db)
-        .update_many(
-            doc! { "isWhitelisted": { "$exists": false } },
-            doc! { "$set": { "isWhitelisted": true } },
-        )
-        .await?;
-
-    Ok(legacy.modified_count)
-}
 
 pub async fn repair_broken_account_status_fields(db: &Database) -> Result<u64, mongodb::error::Error> {
     let result = User::collection(db)

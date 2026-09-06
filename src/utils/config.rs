@@ -10,7 +10,6 @@ use std::env;
 
 use crate::utils::env::{is_production, node_env};
 use crate::utils::auth::jwt::jwt_secret;
-use crate::utils::whitelist::is_whitelist_enabled;
 use crate::utils::registration::{
     is_registration_disabled, signup_max_global_per_day, signup_max_global_per_hour,
     signup_max_per_ip_hour,
@@ -202,10 +201,6 @@ pub fn validate_startup_config() {
         validate_livekit_env();
         validate_clamav_env(true);
 
-        if is_whitelist_enabled() {
-            log::info!("Whitelist mode is enabled — new accounts require admin approval");
-        }
-
         if is_registration_disabled() {
             log::warn!("Registration is DISABLED — new signups are rejected");
         } else {
@@ -228,10 +223,6 @@ pub fn validate_startup_config() {
 
     validate_r2_env();
     validate_clamav_env(false);
-
-    if is_whitelist_enabled() {
-        log::info!("Whitelist mode is enabled — new accounts require admin approval");
-    }
 
     if jwt_secret().is_err() {
         log::warn!(

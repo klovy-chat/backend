@@ -34,13 +34,12 @@ fn iso(dt: &mongodb::bson::DateTime) -> Option<String> {
     dt.try_to_rfc3339_string().ok()
 }
 
-pub fn serialize_user(user: &User, is_whitelist_enabled: Option<bool>) -> Value {
-    serialize_user_for_viewer(user, is_whitelist_enabled, true)
+pub fn serialize_user(user: &User) -> Value {
+    serialize_user_for_viewer(user, true)
 }
 
 pub fn serialize_user_for_viewer(
     user: &User,
-    is_whitelist_enabled: Option<bool>,
     is_self: bool,
 ) -> Value {
     let bio = user
@@ -62,8 +61,6 @@ pub fn serialize_user_for_viewer(
         "lastSeen": user.last_seen.as_ref().and_then(iso),
         "availabilityStatus": availability_status_str(&user.availability_status),
         "createdAt": iso(&user.created_at),
-        "isWhitelisted": user.is_whitelisted,
-        "isWhitelistEnabled": is_whitelist_enabled,
         "twoFactorEnabled": user.two_factor_enabled,
     });
 

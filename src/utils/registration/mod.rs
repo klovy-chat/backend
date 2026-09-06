@@ -1,10 +1,10 @@
 // mod.rs
-// Czy signup otwarty / whitelist / disabled.
+// Czy signup otwarty / disabled + limity rejestracji.
 // Zakres:
 //  - czytane przez middleware
-//  - signup open / whitelist / disabled — czyta middleware
+//  - signup open / disabled — czyta middleware
 // Zmiana bez FE = 403 z komunikatem API.
-// Przy zmianach: signup.rs, whitelist/mod.rs.
+// Przy zmianach: signup.rs, controllers/auth.rs.
 
 use std::env;
 
@@ -45,7 +45,13 @@ pub fn is_registration_disabled() -> bool {
 }
 
 pub fn signup_max_per_ip_hour() -> u32 {
-    env_u32("SIGNUP_MAX_PER_IP_HOUR", if is_production() { 3 } else { 10 })
+    // A single public IP is routinely shared by many legitimate users (home NAT,
+    // schools, offices, mobile CGNAT). A prod cap of 3/hour — which also counts
+    // failed attempts such as "username taken" — meant a couple of typos from one
+    // person could lock out everyone else behind that IP, so some people could
+    // sign up while others couldn't. Keep an anti-abuse ceiling but make it far
+    // less likely to catch real users. Override with SIGNUP_MAX_PER_IP_HOUR.
+    env_u32("SIGNUP_MAX_PER_IP_HOUR", if is_production() { 8 } else { 20 })
 }
 
 pub fn signup_max_global_per_hour() -> u64 {
@@ -113,13 +119,13 @@ async fn try_consume_window(
     max: u64,
 ) -> mongodb::error::Result<bool> {
     let now = DateTime::now();
-    let filter = doc! {
-        "_id": key,
-        "$or": [
-            { "count": { "$exists": false } },
-            { "count": { "$lt": max as i64 } }
-        ]
-    };
+
+    // Increment unconditionally with a plain `_id` filter (which always matches an
+    // existing bucket, so `upsert` only ever inserts a brand-new window). This
+    // avoids the previous conditional-upsert filter, which — once the bucket was
+    // full — matched nothing and made MongoDB attempt a duplicate-`_id` insert,
+    // surfacing a write error that callers mistranslated into a misleading
+    // "temporarily unavailable" 503 instead of a proper rate-limit response.
     let update = doc! {
         "$inc": { "count": 1 },
         "$set": { "updatedAt": now },
@@ -129,12 +135,27 @@ async fn try_consume_window(
         .return_document(ReturnDocument::After)
         .build();
 
-    let result = quota_collection(db)
-        .find_one_and_update(filter, update)
+    let updated = quota_collection(db)
+        .find_one_and_update(doc! { "_id": key }, update)
         .with_options(options)
         .await?;
 
-    Ok(result.is_some_and(|doc| doc.count <= max as i64))
+    let count = updated.map(|doc| doc.count).unwrap_or(0);
+    if count <= max as i64 {
+        return Ok(true);
+    }
+
+    // Over the limit: undo our speculative increment so the bucket settles at
+    // `max` and later windows aren't inflated. Best-effort — a lost decrement
+    // only makes the limiter marginally stricter, never looser.
+    let _ = quota_collection(db)
+        .update_one(
+            doc! { "_id": key, "count": { "$gt": 0_i64 } },
+            doc! { "$inc": { "count": -1 } },
+        )
+        .await;
+
+    Ok(false)
 }
 
 pub async fn try_consume_global_signup_slot(

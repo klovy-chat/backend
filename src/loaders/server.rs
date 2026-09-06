@@ -27,7 +27,6 @@ use crate::middlewares::{
     proxy::{proxy, internal_proxy_secret, INTERNAL_PROXY_HEADER},
     ip_block::{ip_blocker_middleware, track_suspicious_activity, IPBlockerArc},
     origin::origin_guard_middleware,
-    whitelist::whitelist_check,
 };
 
 use crate::utils::ratelimit::{
@@ -269,105 +268,86 @@ pub fn create_app(
         .service(
             web::scope("/api/channel")
                 .wrap(from_fn(send_limiter))
-                .wrap(from_fn(whitelist_check))
                 .configure(channels::configure),
         )
         .service(
             web::scope("/api/channels")
                 .wrap(from_fn(send_limiter))
-                .wrap(from_fn(whitelist_check))
                 .configure(channels::configure),
         )
         .service(
             web::scope("/api/contacts")
-                .wrap(from_fn(whitelist_check))
                 .configure(contacts::configure),
         )
         .service(
             web::scope("/api/contact")
-                .wrap(from_fn(whitelist_check))
                 .configure(contacts::configure),
         )
         .service(
             web::scope("/api/messages")
                 .wrap(from_fn(send_limiter))
-                .wrap(from_fn(whitelist_check))
                 .configure(messages::configure),
         )
         .service(
             web::scope("/api/message")
                 .wrap(from_fn(send_limiter))
-                .wrap(from_fn(whitelist_check))
                 .configure(messages::configure),
         )
         .service(
             web::scope("/api/friends")
-                .wrap(from_fn(whitelist_check))
                 .configure(friends::configure),
         )
         .service(
             web::scope("/api/friend")
-                .wrap(from_fn(whitelist_check))
                 .configure(friends::configure),
         )
         .service(
             web::scope("/api/gifs")
                 .wrap(from_fn(send_limiter))
-                .wrap(from_fn(whitelist_check))
                 .configure(gifs::configure),
         )
         .service(
             web::scope("/api/gif")
                 .wrap(from_fn(send_limiter))
-                .wrap(from_fn(whitelist_check))
                 .configure(gifs::configure),
         )
         .service(
             web::scope("/api/stickers")
                 .wrap(from_fn(send_limiter))
-                .wrap(from_fn(whitelist_check))
                 .configure(stickers::configure),
         )
         .service(
             web::scope("/api/emojis")
-                .wrap(from_fn(whitelist_check))
                 .configure(emojis::configure),
         )
         .service(
             web::scope("/api/emoji")
-                .wrap(from_fn(whitelist_check))
                 .configure(emojis::configure),
         )
         .service(
             web::scope("/api/voice")
                 .wrap(from_fn(send_limiter))
-                .wrap(from_fn(whitelist_check))
                 .configure(voice::configure),
         )
         .service(
             web::scope("/api/voices")
                 .wrap(from_fn(send_limiter))
-                .wrap(from_fn(whitelist_check))
                 .configure(voice::configure),
         )
         .service(
             web::scope("/api/user")
-                .wrap(from_fn(whitelist_check))
                 .configure(users::configure),
         )
         .service(
             web::scope("/api/users")
-                .wrap(from_fn(whitelist_check))
                 .configure(users::configure),
         )
         .service(
             web::scope("/api/user/status")
-                .wrap(from_fn(whitelist_check))
                 .configure(status::configure),
         )
         .service(
             web::scope("/api/status")
-                .wrap(from_fn(whitelist_check))
                 .configure(status::configure),
         )
         .service(
@@ -379,12 +359,10 @@ pub fn create_app(
         )
         .service(
             web::scope("/api/invite")
-                .wrap(from_fn(whitelist_check))
                 .configure(invites::configure),
         )
         .service(
             web::scope("/api/invites")
-                .wrap(from_fn(whitelist_check))
                 .configure(invites::configure),
         )
         .default_service(web::to(not_found_handler))

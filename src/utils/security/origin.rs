@@ -81,7 +81,7 @@ pub fn requires_origin_guard(method: &Method, path: &str) -> bool {
         return false;
     }
     let path = canonicalize_request_path(path);
-    path.starts_with("/api") || path.starts_with("/whitelist")
+    path.starts_with("/api")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

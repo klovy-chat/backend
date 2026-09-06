@@ -50,7 +50,6 @@ use crate::utils::validators::username::{is_valid_username, looks_like_email, no
 use crate::utils::validators::leaked_password::{check_password_breach, PasswordBreachCheck};
 use crate::utils::security::csrf::{build_csrf_cookie, clear_csrf_cookie, csrf_token_for_response, generate_csrf_token};
 use crate::utils::security::monitor::{SecurityEventType, SecurityMonitor};
-use crate::utils::whitelist::is_whitelist_enabled;
 use crate::utils::registration::{is_registration_open, try_consume_global_signup_slot};
 
 use crate::utils::env::is_production;
@@ -64,10 +63,6 @@ use crate::utils::storage::{
 };
 
 const ALLOWED_IMAGE_EXT: &[&str] = &["jpg", "jpeg", "png", "webp"];
-
-fn whitelist_flag() -> Option<bool> {
-    Some(is_whitelist_enabled())
-}
 
 fn req_user_id(req: &HttpRequest) -> Option<String> {
     req.extensions().get::<RequestUserId>().map(|u| u.0.clone())
@@ -315,7 +310,6 @@ async fn login_response(req: &HttpRequest, user: User) -> HttpResponse {
         Err(_) => return HttpResponse::InternalServerError().body("Internal Server Error"),
     };
 
-    let whitelist_enabled = is_whitelist_enabled();
     let csrf = generate_csrf_token();
     HttpResponse::Ok()
         .cookie(jwt_cookie(&token, ACCESS_MAX_AGE_MS))
@@ -323,7 +317,7 @@ async fn login_response(req: &HttpRequest, user: User) -> HttpResponse {
         .cookie(clear_legacy_refresh_cookie())
         .cookie(build_csrf_cookie(&csrf))
         .json(json!({
-            "user": serialize_user(&user, Some(whitelist_enabled)),
+            "user": serialize_user(&user),
             "csrfToken": csrf,
         }))
 }
@@ -506,15 +500,9 @@ pub async fn signup(
     .await
     {
         Ok(user) => {
-            let whitelist_enabled = is_whitelist_enabled();
-            let message = if whitelist_enabled {
-                "Konto utworzone. Administrator musi je zatwierdzić, zanim będziesz mógł korzystać z aplikacji."
-            } else {
-                "Konto utworzone. Możesz się zalogować."
-            };
             HttpResponse::Created().json(json!({
-                "message": message,
-                "user": serialize_user(&user, Some(whitelist_enabled)),
+                "message": "Konto utworzone. Możesz się zalogować.",
+                "user": serialize_user(&user),
             }))
         }
         Err(e) => {
@@ -1174,7 +1162,7 @@ pub async fn change_username(
                 }),
             )
             .await;
-            HttpResponse::Ok().json(serialize_user(&user, whitelist_flag()))
+            HttpResponse::Ok().json(serialize_user(&user))
         }
         Ok(None) => HttpResponse::NotFound().body("User not found."),
         Err(_) => {
@@ -1214,7 +1202,6 @@ pub async fn refresh_session(req: HttpRequest) -> HttpResponse {
                 Err(_) => return HttpResponse::InternalServerError().body("Internal Server Error"),
             };
 
-            let whitelist_enabled = is_whitelist_enabled();
             let csrf = generate_csrf_token();
             HttpResponse::Ok()
                 .cookie(jwt_cookie(&access, ACCESS_MAX_AGE_MS))
@@ -1225,7 +1212,7 @@ pub async fn refresh_session(req: HttpRequest) -> HttpResponse {
                 .cookie(clear_legacy_refresh_cookie())
                 .cookie(build_csrf_cookie(&csrf))
                 .json(json!({
-                    "user": serialize_user(&session.user, Some(whitelist_enabled)),
+                    "user": serialize_user(&session.user),
                     "csrfToken": csrf,
                 }))
         }
@@ -1291,7 +1278,7 @@ pub async fn list_sessions(req: HttpRequest) -> HttpResponse {
         return HttpResponse::NotFound().body("User not found.");
     };
 
-    let current_family_id = if let Some(cookie) = req.cookie(REFRESH_COOKIE) {
+    let mut current_family_id = if let Some(cookie) = req.cookie(REFRESH_COOKIE) {
         match family_id_from_refresh_token(cookie.value()).await {
             Ok(v) => v,
             Err(RefreshAuthError::Unavailable) => {
@@ -1304,6 +1291,16 @@ pub async fn list_sessions(req: HttpRequest) -> HttpResponse {
     } else {
         None
     };
+
+    // Fall back to the access token's family claim when the refresh cookie is
+    // absent or not scoped to this path (e.g. a legacy cookie), so the current
+    // device is still flagged correctly in the list.
+    if current_family_id.is_none() {
+        if let Some(jwt) = req.cookie("jwt") {
+            current_family_id =
+                crate::utils::auth::jwt::session_family_from_jwt(jwt.value());
+        }
+    }
 
     match list_user_sessions(oid, current_family_id.as_deref()).await {
         Ok(sessions) => HttpResponse::Ok().json(json!({ "sessions": sessions })),
@@ -1452,8 +1449,7 @@ pub async fn get_user_info(req: HttpRequest) -> HttpResponse {
         Err(_) => return HttpResponse::InternalServerError().body("Internal Server Error"),
     };
 
-    let whitelist_enabled = is_whitelist_enabled();
-    let mut payload = serialize_user(&user, Some(whitelist_enabled));
+    let mut payload = serialize_user(&user);
 
     let (csrf, csrf_cookie) = csrf_token_for_response(&req);
     if let Some(obj) = payload.as_object_mut() {
@@ -1590,7 +1586,7 @@ pub async fn update_profile(req: HttpRequest, body: web::Json<UpdateProfileBody>
                 }),
             )
             .await;
-            HttpResponse::Ok().json(serialize_user(&user, whitelist_flag()))
+            HttpResponse::Ok().json(serialize_user(&user))
         }
         Ok(None) => HttpResponse::NotFound().body("User not found."),
         Err(_) => HttpResponse::InternalServerError().body("Internal Server Error."),
@@ -1610,7 +1606,7 @@ pub async fn update_language(req: HttpRequest, body: web::Json<UpdateLanguageBod
 
     let db = get_db();
     match User::set_fields(&db, oid, set).await {
-        Ok(Some(user)) => HttpResponse::Ok().json(serialize_user(&user, whitelist_flag())),
+        Ok(Some(user)) => HttpResponse::Ok().json(serialize_user(&user)),
         Ok(None) => HttpResponse::NotFound().body("User not found."),
         Err(_) => HttpResponse::InternalServerError().body("Internal Server Error."),
     }
@@ -1659,7 +1655,7 @@ pub async fn update_availability_status(
                 }),
             )
             .await;
-            HttpResponse::Ok().json(serialize_user(&user, whitelist_flag()))
+            HttpResponse::Ok().json(serialize_user(&user))
         }
         Ok(None) => HttpResponse::NotFound().body("User not found."),
         Err(_) => HttpResponse::InternalServerError().body("Internal Server Error."),
