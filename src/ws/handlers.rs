@@ -3658,13 +3658,25 @@ pub async fn dispatch_message(
                 return;
             }
             let connected = connected.to_string();
+            let state = state.clone();
             tokio::spawn(async move {
+                if state.connection_count(&connected) == 0 {
+                    return;
+                }
                 if !set_user_online(&connected).await {
+                    return;
+                }
+                if state.connection_count(&connected) == 0 {
+                    let _ = set_user_offline(&connected).await;
                     return;
                 }
                 let Some(availability) = availability_status_for_user(&connected).await else {
                     return;
                 };
+                if state.connection_count(&connected) == 0 {
+                    let _ = set_user_offline(&connected).await;
+                    return;
+                }
                 broadcast_user_status(
                     &connected,
                     json!({
