@@ -3315,13 +3315,26 @@ fn emit_send_error(
     registry::emit_to_user(user_id, "error", body);
 }
 
-pub async fn on_user_connected(user_id: &str) {
+pub async fn on_user_connected(user_id: &str, socket_state: &SocketState) {
     finalize_expired_ringing_sessions().await;
+    if !socket_state.is_user_connected(user_id) || socket_state.connection_count(user_id) == 0 {
+        return;
+    }
     if !set_user_online(user_id).await {
+        return;
+    }
+    // The connection may have disappeared while the database update was in flight.
+    // Do not publish an online event for a socket that is already gone.
+    if !socket_state.is_user_connected(user_id) || socket_state.connection_count(user_id) == 0 {
+        let _ = set_user_offline(user_id).await;
         return;
     }
 
     if let Some(availability) = availability_status_for_user(user_id).await {
+        if !socket_state.is_user_connected(user_id) || socket_state.connection_count(user_id) == 0 {
+            let _ = set_user_offline(user_id).await;
+            return;
+        }
         broadcast_user_status(
             user_id,
             json!({

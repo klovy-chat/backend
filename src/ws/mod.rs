@@ -282,8 +282,9 @@ async fn handle_socket(
 
     if is_first_connection {
         let user_id_for_presence = user_id.clone();
+        let socket_state_for_presence = app_state.socket_state.clone();
         tokio::spawn(async move {
-            on_user_connected(&user_id_for_presence).await;
+            on_user_connected(&user_id_for_presence, &socket_state_for_presence).await;
         });
     }
     log::info!("User connected: {}", user_id);
