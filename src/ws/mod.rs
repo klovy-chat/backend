@@ -533,7 +533,7 @@ async fn handle_socket(
         let user_id_for_presence = user_id.clone();
         let socket_state = app_state.socket_state.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(400)).await;
+            tokio::time::sleep(Duration::from_secs(3)).await;
             if socket_state.is_user_connected(&user_id_for_presence)
                 || socket_state.connection_count(&user_id_for_presence) > 0
             {
