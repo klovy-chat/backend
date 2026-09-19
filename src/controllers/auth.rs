@@ -1478,9 +1478,10 @@ pub async fn revoke_all_sessions(req: HttpRequest) -> HttpResponse {
         }));
     }
 
+    let revoked_count = families.len();
     let user_hex = oid.to_hex();
-    for family in families {
-        revoke_session_remotely(&user_hex, &family);
+    for family in &families {
+        revoke_session_remotely(&user_hex, family);
     }
     disconnect_user(&user_hex);
 
@@ -1491,7 +1492,7 @@ pub async fn revoke_all_sessions(req: HttpRequest) -> HttpResponse {
         .cookie(clear_csrf_cookie())
         .json(json!({
             "message": "Wylogowano wszystkie sesje.",
-            "revokedCount": families.len(),
+            "revokedCount": revoked_count,
         }))
 }
 
