@@ -21,7 +21,7 @@ use crate::routes::auth::{ProfileBannerForm, ProfileImageForm};
 use crate::utils::auth::tokens::{create_access_token, ACCESS_MAX_AGE_MS, REFRESH_MAX_AGE_MS};
 use crate::utils::auth::refresh::{
     family_id_from_refresh_token, issue_refresh_token, list_user_sessions,
-    revoke_all_sessions_for_user, revoke_other_sessions_for_user, revoke_refresh_token_family, revoke_session_for_user,
+    revoke_other_sessions_for_user, revoke_refresh_token_family, revoke_session_for_user,
     revoke_user_refresh_tokens, rotate_refresh_token, RefreshAuthError, REFRESH_COOKIE,
 };
 use crate::utils::auth::metadata::session_metadata_from_request;

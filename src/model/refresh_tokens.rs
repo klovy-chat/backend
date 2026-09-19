@@ -188,6 +188,33 @@ impl RefreshToken {
         Ok(count > 0)
     }
 
+    pub async fn active_family_ids_for_user(
+        db: &Database,
+        user_id: ObjectId,
+    ) -> mongodb::error::Result<Vec<String>> {
+        use futures_util::TryStreamExt;
+
+        let now = BsonDateTime::now();
+        let tokens: Vec<Self> = Self::collection(db)
+            .find(doc! {
+                "userId": user_id,
+                "revoked": false,
+                "expiresAt": { "$gt": now },
+            })
+            .await?
+            .try_collect()
+            .await?;
+
+        let mut families = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for token in tokens {
+            if seen.insert(token.family_id.clone()) {
+                families.push(token.family_id);
+            }
+        }
+        Ok(families)
+    }
+
     pub async fn active_family_ids_for_user_except(
         db: &Database,
         user_id: ObjectId,

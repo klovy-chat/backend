@@ -388,22 +388,6 @@ pub async fn revoke_other_sessions_for_user(
         .map_err(|e| e.to_string())
 }
 
-pub async fn revoke_all_sessions_for_user(user_id: ObjectId) -> Result<u64, String> {
-    let db = get_db();
-    let families = RefreshToken::active_family_ids_for_user(&db, user_id)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let revoked = RefreshToken::revoke_all_for_user(&db, user_id)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    // The revoke_all_for_user call itself returns Mongo's modified count, but the
-    // API here is used for UX feedback and a stream of websocket disconnects.
-    let _ = families;
-    Ok(revoked)
-}
-
 pub async fn revoke_user_refresh_tokens(user_id: ObjectId) -> Result<(), String> {
     let db = get_db();
     RefreshToken::revoke_all_for_user(&db, user_id)
