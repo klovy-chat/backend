@@ -13,7 +13,7 @@ use actix_web_lab::middleware::from_fn;
 use crate::controllers::auth::{
     acknowledge_my_warnings, add_profile_banner, add_profile_image, change_password,
     change_username, disable_account, disable_two_factor, enable_two_factor, get_my_warnings, get_user_info, list_sessions, login,
-    logout, refresh_session, registration_status, issue_ws_crypto_key, remove_profile_banner, remove_profile_image, request_account_deletion, cancel_account_deletion, revoke_other_sessions, revoke_session, setup_two_factor, signup,
+    logout, refresh_session, registration_status, issue_ws_crypto_key, remove_profile_banner, remove_profile_image, request_account_deletion, cancel_account_deletion, revoke_all_sessions, revoke_other_sessions, revoke_session, setup_two_factor, signup,
     update_availability_status, update_language, update_profile, verify_two_factor_login,
 };
 use crate::middlewares::signup::registration_closed;
@@ -353,6 +353,13 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .wrap(from_fn(require_active_account))
             .wrap(from_fn(verify_token))
             .route(web::post().to(revoke_other_sessions)),
+    );
+
+    cfg.service(
+        web::resource("/sessions/revoke-all")
+            .wrap(from_fn(require_active_account))
+            .wrap(from_fn(verify_token))
+            .route(web::post().to(revoke_all_sessions)),
     );
 
     cfg.service(

@@ -21,7 +21,7 @@ use crate::routes::auth::{ProfileBannerForm, ProfileImageForm};
 use crate::utils::auth::tokens::{create_access_token, ACCESS_MAX_AGE_MS, REFRESH_MAX_AGE_MS};
 use crate::utils::auth::refresh::{
     family_id_from_refresh_token, issue_refresh_token, list_user_sessions,
-    revoke_other_sessions_for_user, revoke_refresh_token_family, revoke_session_for_user,
+    revoke_all_sessions_for_user, revoke_other_sessions_for_user, revoke_refresh_token_family, revoke_session_for_user,
     revoke_user_refresh_tokens, rotate_refresh_token, RefreshAuthError, REFRESH_COOKIE,
 };
 use crate::utils::auth::metadata::session_metadata_from_request;
@@ -1229,6 +1229,8 @@ pub async fn refresh_session(req: HttpRequest) -> HttpResponse {
 }
 
 pub async fn logout(req: HttpRequest) -> HttpResponse {
+    let user_id = req_user_id(&req);
+
     if let Some(cookie) = req.cookie(REFRESH_COOKIE) {
         let raw = cookie.value();
         let family_id = match family_id_from_refresh_token(raw).await {
@@ -1240,6 +1242,7 @@ pub async fn logout(req: HttpRequest) -> HttpResponse {
             }
             Err(RefreshAuthError::Denied) => None,
         };
+
         match revoke_refresh_token_family(raw).await {
             Ok(Some(user_id)) => {
                 let uid = user_id.to_hex();
@@ -1249,14 +1252,22 @@ pub async fn logout(req: HttpRequest) -> HttpResponse {
                     disconnect_user(&uid);
                 }
             }
-            Ok(None) => {}
+            Ok(None) => {
+                if let Some(user_id) = user_id.clone() {
+                    if let Ok(oid) = ObjectId::parse_str(&user_id) {
+                        disconnect_user(&oid.to_hex());
+                    }
+                }
+            }
             Err(RefreshAuthError::Unavailable) | Err(RefreshAuthError::Denied) => {
-                return HttpResponse::ServiceUnavailable().json(json!({
-                    "message": "Temporarily unavailable. Retry."
-                }));
+                if let Some(user_id) = user_id.clone() {
+                    if let Ok(oid) = ObjectId::parse_str(&user_id) {
+                        disconnect_user(&oid.to_hex());
+                    }
+                }
             }
         }
-    } else if let Some(user_id) = req_user_id(&req) {
+    } else if let Some(user_id) = user_id.clone() {
         if let Ok(oid) = ObjectId::parse_str(&user_id) {
             disconnect_user(&oid.to_hex());
         }
@@ -1348,6 +1359,10 @@ pub async fn revoke_session(req: HttpRequest) -> HttpResponse {
         Ok(_) => {
             revoke_session_remotely(&oid.to_hex(), family_id);
             if revoking_current {
+                if let Err(err) = User::invalidate_tokens(&get_db(), oid).await {
+                    log::warn!("Failed to invalidate token version when revoking current session for user {}: {}", oid, err);
+                }
+                disconnect_user(&oid.to_hex());
                 HttpResponse::Ok()
                     .cookie(jwt_cookie("", 0))
                     .cookie(clear_refresh_cookie())
@@ -1432,6 +1447,52 @@ pub async fn revoke_other_sessions(req: HttpRequest) -> HttpResponse {
             "message": "Nie udało się wylogować innych sesji."
         })),
     }
+}
+
+pub async fn revoke_all_sessions(req: HttpRequest) -> HttpResponse {
+    let Some(user_id) = req_user_id(&req) else {
+        return HttpResponse::Unauthorized().body("User not authenticated.");
+    };
+    let Ok(oid) = ObjectId::parse_str(&user_id) else {
+        return HttpResponse::NotFound().body("User not found.");
+    };
+
+    let db = get_db();
+    let families = match RefreshToken::active_family_ids_for_user(&db, oid).await {
+        Ok(families) => families,
+        Err(_) => {
+            return HttpResponse::InternalServerError().json(json!({
+                "message": "Nie udało się wylogować wszystkich sesji."
+            }));
+        }
+    };
+
+    if let Err(err) = User::invalidate_tokens(&db, oid).await {
+        log::warn!("Failed to invalidate token version for full logout user {}: {}", oid, err);
+    }
+
+    if let Err(err) = RefreshToken::revoke_all_for_user(&db, oid).await {
+        log::warn!("Failed to revoke all refresh families for user {}: {}", oid, err);
+        return HttpResponse::InternalServerError().json(json!({
+            "message": "Nie udało się wylogować wszystkich sesji."
+        }));
+    }
+
+    let user_hex = oid.to_hex();
+    for family in families {
+        revoke_session_remotely(&user_hex, &family);
+    }
+    disconnect_user(&user_hex);
+
+    HttpResponse::Ok()
+        .cookie(jwt_cookie("", 0))
+        .cookie(clear_refresh_cookie())
+        .cookie(clear_legacy_refresh_cookie())
+        .cookie(clear_csrf_cookie())
+        .json(json!({
+            "message": "Wylogowano wszystkie sesje.",
+            "revokedCount": families.len(),
+        }))
 }
 
 pub async fn get_user_info(req: HttpRequest) -> HttpResponse {
