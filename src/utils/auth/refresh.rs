@@ -215,7 +215,7 @@ pub async fn rotate_refresh_token(
     if stored.revoked {
         let _ = RefreshToken::revoke_family(&db, &stored.family_id).await;
         let _ = User::invalidate_tokens(&db, stored.user_id).await;
-        crate::ws::registry::disconnect_user(&stored.user_id.to_hex());
+        crate::ws::registry::revoke_session_remotely(&stored.user_id.to_hex(), &stored.family_id);
         return Err(RefreshAuthError::Denied);
     }
 
@@ -227,7 +227,7 @@ pub async fn rotate_refresh_token(
             _ => {
                 let _ = RefreshToken::revoke_family(&db, &stored.family_id).await;
                 let _ = User::invalidate_tokens(&db, stored.user_id).await;
-                crate::ws::registry::disconnect_user(&stored.user_id.to_hex());
+                crate::ws::registry::revoke_session_remotely(&stored.user_id.to_hex(), &stored.family_id);
                 return Err(RefreshAuthError::Denied);
             }
         }

@@ -225,7 +225,6 @@ pub fn revoke_session_remotely(user_id: &str, family_id: &str) {
     tokio::spawn(async move {
         reg.send_to_family(&uid, &fid, "session:revoked", json!({}))
             .await;
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         reg.disconnect_family(&uid, &fid).await;
     });
 }
