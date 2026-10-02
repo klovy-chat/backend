@@ -8,7 +8,8 @@ use actix_web::{
 use actix_web_lab::middleware::Next;
 use mongodb::bson::oid::ObjectId;
 
-use crate::middlewares::auth::{resolve_authenticated_user, JwtUserError};
+use crate::middlewares::auth::resolve_authenticated_user;
+use crate::utils::auth::jwt::JwtUserError;
 
 fn parse_admin_user_ids(value: &str) -> Result<HashSet<ObjectId>, ()> {
     let mut user_ids = HashSet::new();
@@ -33,7 +34,7 @@ pub async fn require_admin(
     req: ServiceRequest,
     next: Next<impl MessageBody + 'static>,
 ) -> Result<ServiceResponse<BoxBody>, actix_web::Error> {
-    let user = match resolve_authenticated_user(req.request()).await {
+    let user = match resolve_authenticated_user(&req).await {
         Ok(user) => user,
         Err(JwtUserError::Denied) => {
             let (req, _) = req.into_parts();
