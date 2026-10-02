@@ -16,7 +16,7 @@ use actix_web_lab::middleware::from_fn;
 use std::env;
 
 use crate::routes::{
-    auth, channels, contacts, emojis,
+    admin, auth, channels, contacts, emojis,
     friends, gifs, invites, messages, status,
     stickers, users, voice,
 };
@@ -263,6 +263,10 @@ pub fn create_app(
         .service(web::resource("/api/").route(web::get().to(get_api_info)))
         .service(
             web::scope("/api/auth")
+                        .service(
+                            web::scope("/api/admin")
+                                .configure(admin::configure),
+                        )
                 .configure(auth::configure),
         )
         .service(
