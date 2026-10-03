@@ -8,7 +8,6 @@
 
 pub mod auth_fallback;
 pub mod auth;
-pub mod admin;
 pub mod client;
 pub mod csrf;
 pub mod proxy;

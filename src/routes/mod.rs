@@ -7,7 +7,6 @@
 // Przy zmianach: loaders/server.rs, middlewares/auth.rs.
 
 pub mod auth;
-pub mod admin;
 pub mod channels;
 pub mod contacts;
 pub mod emojis;

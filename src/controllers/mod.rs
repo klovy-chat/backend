@@ -7,7 +7,6 @@
 // Przy zmianach: routes/mod.rs.
 
 pub mod announcements;
-pub mod admin;
 pub mod info;
 pub mod auth;
 pub mod channels;
