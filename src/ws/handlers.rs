@@ -29,7 +29,7 @@ use crate::utils::access::members::{
 use crate::utils::ratelimit::slowmode::{check_channel_slowmode, record_channel_slowmode};
 use crate::utils::db::get_db;
 use crate::utils::friends::try_is_dm_blocked;
-use crate::utils::channel::can_access_channel;
+use crate::utils::channel::{can_access_channel, is_channel_admin};
 use crate::utils::voice::calls::{
     accept_session, cancel_session, create_ringing_session, drain_expired_sessions,
     end_session, reject_session, restore_sessions, ringing_sessions_for_callee,
@@ -848,7 +848,8 @@ pub async fn create_and_broadcast_channel_message(
             ));
         }
     };
-    let mentions_everyone = has_everyone_mention(&prepared_content);
+    let mentions_everyone =
+        is_channel_admin(&channel, Some(&sender_hex)) && has_everyone_mention(&prepared_content);
 
     let scan_status = scan_status_for_attachment(db, &sender_hex, &file_url).await;
     let create_input = CreateMessageInput {
@@ -2023,7 +2024,8 @@ async fn handle_edit_message(connected: &str, payload: EditMessagePayload) {
                     return;
                 }
             };
-            mentions_everyone = has_everyone_mention(&prepared_content);
+            mentions_everyone = is_channel_admin(channel, Some(&user_id))
+                && has_everyone_mention(&prepared_content);
         } else {
             registry::emit_to_user(
                 &user_id,

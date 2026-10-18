@@ -547,7 +547,10 @@ pub async fn edit_message(req: HttpRequest, body: web::Json<EditMessageBody>) ->
                 }));
             }
         };
-        (mentions, has_everyone_mention(&content))
+        (
+            mentions,
+            is_channel_admin(&channel, Some(&user_id)) && has_everyone_mention(&content),
+        )
     } else if let Some(recipient) = message.recipient {
         let mentions = match resolve_mentions(
             &db,
