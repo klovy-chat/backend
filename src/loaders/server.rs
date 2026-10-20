@@ -17,7 +17,7 @@ use std::env;
 
 use crate::routes::{
     auth, channels, contacts, emojis,
-    friends, gifs, invites, messages, status,
+    friends, gifs, invites, messages,
     stickers, users, voice,
 };
 
@@ -341,14 +341,6 @@ pub fn create_app(
         .service(
             web::scope("/api/users")
                 .configure(users::configure),
-        )
-        .service(
-            web::scope("/api/user/status")
-                .configure(status::configure),
-        )
-        .service(
-            web::scope("/api/status")
-                .configure(status::configure),
         )
         .service(
             web::scope("/api/security")

@@ -127,6 +127,8 @@ fn user_to_channel_json(user: &User) -> Value {
         "image": user.image,
         "banner": user.banner,
         "color": user.color,
+        "isOnline": user.is_online,
+        "lastSeen": user.last_seen.as_ref().and_then(|d| d.try_to_rfc3339_string().ok()),
     })
 }
 

@@ -467,7 +467,6 @@ impl SocketState {
 
         crate::ws::typing::clear_user(user_id);
         crate::utils::access::cache::clear_user(user_id);
-        crate::utils::user::online::clear(user_id);
         crate::utils::friends::cache::invalidate_block_pair_for_user(user_id);
         let mut typing = self.typing_users.lock().unwrap_or_else(|e| e.into_inner());
         for users in typing.values_mut() {

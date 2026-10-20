@@ -63,6 +63,7 @@ pub async fn purge_removed_schema_fields(
                     { "connectedAccounts": { "$exists": true } },
                     { "badges": { "$exists": true } },
                     { "featuredBadgeIds": { "$exists": true } },
+                    { "availabilityStatus": { "$exists": true } },
                 ]
             },
             doc! {
@@ -75,6 +76,7 @@ pub async fn purge_removed_schema_fields(
                     "connectedAccounts": "",
                     "badges": "",
                     "featuredBadgeIds": "",
+                    "availabilityStatus": "",
                 }
             },
         )

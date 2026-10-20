@@ -121,7 +121,6 @@ fn friend_profile_json(friend: &User) -> serde_json::Value {
         "color": friend.color,
         "isOnline": friend.is_online,
         "lastSeen": friend.last_seen.as_ref().and_then(|d| d.try_to_rfc3339_string().ok()),
-        "availabilityStatus": crate::utils::user::json::availability_status_str(&friend.availability_status),
         "createdAt": friend.created_at.try_to_rfc3339_string().ok(),
     })
 }

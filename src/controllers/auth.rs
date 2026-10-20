@@ -38,7 +38,7 @@ use crate::utils::auth::two_factor::{
 };
 use crate::utils::crypto::passwords::verify_user_password;
 use crate::ws::registry::{disconnect_user, revoke_session_remotely};
-use crate::utils::friends::{emit_profile_event, emit_status_event};
+use crate::utils::friends::emit_profile_event;
 use crate::utils::db::get_db;
 use crate::utils::user::json::{resolve_display_name, serialize_user, BIO_MAX_LENGTH, DISPLAY_NAME_MAX_LENGTH};
 use crate::utils::upload::{
@@ -191,12 +191,6 @@ pub struct UpdateProfileBody {
     pub display_name: Option<String>,
     pub bio: Option<String>,
     pub color: Option<i32>,
-}
-
-#[derive(Deserialize)]
-pub struct AvailabilityBody {
-    #[serde(rename = "availabilityStatus")]
-    pub availability_status: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1669,56 +1663,6 @@ pub async fn update_language(req: HttpRequest, body: web::Json<UpdateLanguageBod
     let db = get_db();
     match User::set_fields(&db, oid, set).await {
         Ok(Some(user)) => HttpResponse::Ok().json(serialize_user(&user)),
-        Ok(None) => HttpResponse::NotFound().body("User not found."),
-        Err(_) => HttpResponse::InternalServerError().body("Internal Server Error."),
-    }
-}
-
-pub async fn update_availability_status(
-    req: HttpRequest,
-    body: web::Json<AvailabilityBody>,
-) -> HttpResponse {
-    let Some(user_id) = req_user_id(&req) else {
-        return HttpResponse::BadRequest().body("User ID is required.");
-    };
-    let Ok(oid) = ObjectId::parse_str(&user_id) else {
-        return HttpResponse::NotFound().body("User not found.");
-    };
-
-    let status = body.availability_status.as_deref().unwrap_or("");
-    if !matches!(status, "online" | "away" | "brb" | "dnd") {
-        return HttpResponse::BadRequest().body("Invalid availability status.");
-    }
-
-    let db = get_db();
-
-    match User::set_fields(
-        &db,
-        oid,
-        doc! {
-            "availabilityStatus": status,
-            "isOnline": true,
-        },
-    )
-    .await
-    {
-        Ok(Some(user)) => {
-            crate::utils::user::online::put(&user_id, status);
-            emit_status_event(
-                &db,
-                &user_id,
-                json!({
-                    "userId": user_id,
-                    "status": {
-                        "isOnline": true,
-                        "availabilityStatus": status,
-                        "lastSeen": serde_json::Value::Null,
-                    },
-                }),
-            )
-            .await;
-            HttpResponse::Ok().json(serialize_user(&user))
-        }
         Ok(None) => HttpResponse::NotFound().body("User not found."),
         Err(_) => HttpResponse::InternalServerError().body("Internal Server Error."),
     }

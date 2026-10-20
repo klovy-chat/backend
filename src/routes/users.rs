@@ -1,7 +1,7 @@
 // users.rs
 // Routing użytkowników.
 // Zakres:
-//  - GET profilu, search, availability
+//  - GET profilu, search, obecność użytkownika
 //  - wrap JWT jak inne prywatne ścieżki
 // Logika w controllers/users.rs, tu tylko routing.
 // Przy zmianach: controllers/users.rs.

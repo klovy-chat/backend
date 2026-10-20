@@ -250,7 +250,6 @@ static WS_HANDSHAKE: Lazy<Store> = Lazy::new(|| Store::new(60, Duration::from_se
 static CHANGE_PASSWORD: Lazy<Store> = Lazy::new(|| Store::new(5, Duration::from_secs(15 * 60)));
 static CHANGE_USERNAME: Lazy<Store> = Lazy::new(|| Store::new(5, Duration::from_secs(15 * 60)));
 static FRIEND_ACTION: Lazy<Store> = Lazy::new(|| Store::new(120, Duration::from_secs(5 * 60)));
-static STATUS_UPDATE: Lazy<Store> = Lazy::new(|| Store::new(30, Duration::from_secs(60)));
 static PIN_MESSAGE: Lazy<Store> = Lazy::new(|| Store::new(60, Duration::from_secs(60)));
 
 static EDGE_HTTP: Lazy<Store> = Lazy::new(|| Store::new(120, Duration::from_secs(10)));
@@ -538,22 +537,6 @@ pub async fn friend_action_limiter(
         "friend-action",
         "Too many friend actions. Slow down.",
         5 * 60 * 1000,
-        None,
-        req,
-        next,
-    )
-    .await
-}
-
-pub async fn status_update_limiter(
-    req: ServiceRequest,
-    next: Next<impl MessageBody + 'static>,
-) -> Result<ServiceResponse<impl MessageBody>, actix_web::Error> {
-    limit_all(
-        &STATUS_UPDATE,
-        "status-update",
-        "Too many status updates. Slow down.",
-        60 * 1000,
         None,
         req,
         next,

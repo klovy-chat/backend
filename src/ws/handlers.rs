@@ -18,7 +18,7 @@ use crate::model::messages::{
     CreateMessageError, CreateMessageInput, CreateMessageOutcome, Message, MessageType,
 };
 use crate::model::scan::ScanStatus;
-use crate::model::users::{AvailabilityStatus, User};
+use crate::model::users::User;
 use crate::ws::registry;
 use crate::ws::state::{is_valid_object_id, now_ms, SocketState};
 use crate::ws::typing::{self, TypingAccess};
@@ -122,62 +122,6 @@ async fn set_user_offline(user_id: &str) -> bool {
         .await,
         Ok(Some(_))
     )
-}
-
-fn normalize_availability_status(status: &str) -> &'static str {
-    match status.to_lowercase().as_str() {
-        "away" => "away",
-        "brb" => "brb",
-        "dnd" => "dnd",
-        _ => "online",
-    }
-}
-
-async fn set_availability(user_id: &str, status: &str) -> Option<&'static str> {
-    let normalized = normalize_availability_status(status);
-    if !is_valid_object_id(user_id) {
-        return None;
-    }
-    let Ok(oid) = ObjectId::parse_str(user_id) else {
-        return None;
-    };
-
-    match User::set_fields(
-        &get_db(),
-        oid,
-        doc! { "availabilityStatus": normalized },
-    )
-    .await
-    {
-        Ok(Some(_)) => {
-            crate::utils::user::online::put(user_id, normalized);
-            Some(normalized)
-        }
-        Ok(None) | Err(_) => None,
-    }
-}
-
-async fn availability_status_for_user(user_id: &str) -> Option<&'static str> {
-    if let Some(cached) = crate::utils::user::online::get(user_id) {
-        return Some(normalize_availability_status(&cached));
-    }
-    let Ok(oid) = ObjectId::parse_str(user_id) else {
-        return None;
-    };
-    match User::find_by_id(&get_db(), oid).await {
-        Ok(Some(user)) => {
-            let status = match user.availability_status {
-                AvailabilityStatus::Away => "away",
-                AvailabilityStatus::Brb => "brb",
-                AvailabilityStatus::Dnd => "dnd",
-                AvailabilityStatus::Online => "online",
-            };
-            crate::utils::user::online::put(user_id, status);
-            Some(status)
-        }
-        Ok(None) => None,
-        Err(_) => None,
-    }
 }
 
 async fn broadcast_user_status(user_id: &str, status: Value) {
@@ -3332,21 +3276,14 @@ pub async fn on_user_connected(user_id: &str, socket_state: &SocketState) {
         return;
     }
 
-    if let Some(availability) = availability_status_for_user(user_id).await {
-        if !socket_state.is_user_connected(user_id) || socket_state.connection_count(user_id) == 0 {
-            let _ = set_user_offline(user_id).await;
-            return;
-        }
-        broadcast_user_status(
-            user_id,
-            json!({
-                "isOnline": true,
-                "availabilityStatus": availability,
-                "lastSeen": Value::Null,
-            }),
-        )
-        .await;
-    }
+    broadcast_user_status(
+        user_id,
+        json!({
+            "isOnline": true,
+            "lastSeen": Value::Null,
+        }),
+    )
+    .await;
 
     let ringing = ringing_sessions_for_callee(user_id);
     if ringing.is_empty() {
@@ -3467,12 +3404,6 @@ pub async fn on_user_disconnected(user_id: &str, socket_state: &SocketState) {
         return;
     }
 
-    let Some(availability) = availability_status_for_user(user_id).await else {
-        return;
-    };
-    if socket_state.is_user_connected(user_id) || socket_state.connection_count(user_id) > 0 {
-        return;
-    }
     if !set_user_offline(user_id).await {
         return;
     }
@@ -3485,7 +3416,6 @@ pub async fn on_user_disconnected(user_id: &str, socket_state: &SocketState) {
         user_id,
         json!({
             "isOnline": false,
-            "availabilityStatus": availability,
             "lastSeen": now_ms(),
         }),
     )
@@ -3653,116 +3583,6 @@ pub async fn dispatch_message(
                 }) {
                     emit_queue_full_error(connected, None);
                 }
-            }
-        }
-        "set-online" => {
-            if !state.check_rate_limit(connected, "set-online", 30, 60_000) {
-                return;
-            }
-            let connected = connected.to_string();
-            let state = state.clone();
-            tokio::spawn(async move {
-                if state.connection_count(&connected) == 0 {
-                    return;
-                }
-                if !set_user_online(&connected).await {
-                    return;
-                }
-                if state.connection_count(&connected) == 0 {
-                    let _ = set_user_offline(&connected).await;
-                    return;
-                }
-                let Some(availability) = availability_status_for_user(&connected).await else {
-                    return;
-                };
-                if state.connection_count(&connected) == 0 {
-                    let _ = set_user_offline(&connected).await;
-                    return;
-                }
-                broadcast_user_status(
-                    &connected,
-                    json!({
-                        "isOnline": true,
-                        "availabilityStatus": availability,
-                        "lastSeen": Value::Null,
-                    }),
-                )
-                .await;
-            });
-        }
-        "set-offline" => {
-            if !state.check_rate_limit(connected, "set-offline", 30, 60_000) {
-                return;
-            }
-
-            let connected = connected.to_string();
-            let state = state.clone();
-            tokio::spawn(async move {
-                if state.connection_count(&connected) > 1 {
-                    return;
-                }
-                let Some(availability) = availability_status_for_user(&connected).await else {
-                    return;
-                };
-                if state.connection_count(&connected) > 1 {
-                    return;
-                }
-                if !set_user_offline(&connected).await {
-                    return;
-                }
-
-                if state.connection_count(&connected) > 1 {
-                    let _ = set_user_online(&connected).await;
-                    return;
-                }
-                broadcast_user_status(
-                    &connected,
-                    json!({
-                        "isOnline": false,
-                        "availabilityStatus": availability,
-                        "lastSeen": now_ms(),
-                    }),
-                )
-                .await;
-            });
-        }
-        "set-status" => {
-            if !state.check_rate_limit(connected, "set-status", 30, 60_000) {
-                return;
-            }
-
-            let status = payload
-                .get("availabilityStatus")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            if let Some(st) = status {
-                let connected = connected.to_string();
-                tokio::spawn(async move {
-                    let Some(normalized) = set_availability(&connected, &st).await else {
-                        return;
-                    };
-
-                    let Ok(oid) = ObjectId::parse_str(&connected) else {
-                        return;
-                    };
-                    let user = match User::find_by_id(&get_db(), oid).await {
-                        Ok(Some(u)) => u,
-                        Ok(None) | Err(_) => return,
-                    };
-                    let last_seen = user
-                        .last_seen
-                        .map(|ts| json!(ts.timestamp_millis()))
-                        .unwrap_or(Value::Null);
-                    broadcast_user_status(
-                        &connected,
-                        json!({
-                            "isOnline": user.is_online,
-                            "availabilityStatus": normalized,
-                            "lastSeen": if user.is_online { Value::Null } else { last_seen },
-                        }),
-                    )
-                    .await;
-                });
             }
         }
         "call:invite" => {

@@ -18,21 +18,6 @@ use crate::utils::crypto::passwords::{
 };
 use crate::utils::validators::username::{is_valid_username, normalize_username};
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum AvailabilityStatus {
-    Online,
-    Away,
-    Brb,
-    Dnd,
-}
-
-impl Default for AvailabilityStatus {
-    fn default() -> Self {
-        Self::Online
-    }
-}
-
 fn default_language() -> String {
     "en".to_string()
 }
@@ -121,9 +106,6 @@ pub struct User {
 
     #[serde(rename = "isOnline", default)]
     pub is_online: bool,
-
-    #[serde(rename = "availabilityStatus", default)]
-    pub availability_status: AvailabilityStatus,
 
     #[serde(rename = "lastSeen", skip_serializing_if = "Option::is_none")]
     pub last_seen: Option<DateTime>,
@@ -286,7 +268,6 @@ impl User {
             deletion_requested_at: None,
             deletion_scheduled_at: None,
             is_online: false,
-            availability_status: AvailabilityStatus::Online,
             last_seen: None,
             language: input
                 .language

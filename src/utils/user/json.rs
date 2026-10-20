@@ -8,19 +8,10 @@
 
 use serde_json::{json, Value};
 
-use crate::model::users::{AvailabilityStatus, User};
+use crate::model::users::User;
 
 pub const BIO_MAX_LENGTH: usize = 500;
 pub const DISPLAY_NAME_MAX_LENGTH: usize = 32;
-
-pub fn availability_status_str(status: &AvailabilityStatus) -> &'static str {
-    match status {
-        AvailabilityStatus::Online => "online",
-        AvailabilityStatus::Away => "away",
-        AvailabilityStatus::Brb => "brb",
-        AvailabilityStatus::Dnd => "dnd",
-    }
-}
 
 pub fn resolve_display_name(user: &User) -> Option<String> {
     user.display_name
@@ -59,7 +50,6 @@ pub fn serialize_user_for_viewer(
         "color": user.color,
         "isOnline": user.is_online,
         "lastSeen": user.last_seen.as_ref().and_then(iso),
-        "availabilityStatus": availability_status_str(&user.availability_status),
         "createdAt": iso(&user.created_at),
         "twoFactorEnabled": user.two_factor_enabled,
     });

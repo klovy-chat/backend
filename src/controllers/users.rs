@@ -1,10 +1,10 @@
 // users.rs
-// Publiczny profil, search userów, availability HTTP.
+// Publiczny profil, search userów, snapshot obecności.
 // Zakres:
 //  - projekcja bez sekretów
-//  - publiczny profil, search, snapshot availability
+//  - publiczny profil, search, snapshot online/offline
 // Live status i tak idzie WS — tu snapshot.
-// Przy zmianach: utils/user/json.rs, user/online.rs.
+// Przy zmianach: utils/user/json.rs, PresenceContext.
 
 use actix_web::{HttpRequest, HttpResponse};
 use mongodb::bson::oid::ObjectId;
@@ -14,7 +14,6 @@ use crate::middlewares::auth::request_user_id;
 use crate::model::users::User;
 use crate::utils::db::get_db;
 use crate::utils::friends::try_are_friends;
-use crate::utils::user::json::availability_status_str;
 
 pub async fn get_user_status(req: HttpRequest) -> HttpResponse {
     let viewer_id = match request_user_id(&req) {
@@ -52,7 +51,6 @@ pub async fn get_user_status(req: HttpRequest) -> HttpResponse {
             "lastSeen": user.last_seen.as_ref().and_then(|d| d.try_to_rfc3339_string().ok()),
             "image": user.image,
             "color": user.color,
-            "availabilityStatus": availability_status_str(&user.availability_status),
         })),
         Ok(None) => HttpResponse::NotFound().json(json!({ "error": "User not found" })),
         Err(_) => HttpResponse::InternalServerError().json(json!({ "error": "Server error" })),

@@ -16,7 +16,6 @@ pub mod friends;
 pub mod gifs;
 pub mod invites;
 pub mod messages;
-pub mod status;
 pub mod stickers;
 pub mod users;
 pub mod voice;

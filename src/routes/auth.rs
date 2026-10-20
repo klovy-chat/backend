@@ -14,7 +14,7 @@ use crate::controllers::auth::{
     acknowledge_my_warnings, add_profile_banner, add_profile_image, change_password,
     change_username, disable_account, disable_two_factor, enable_two_factor, get_my_warnings, get_user_info, list_sessions, login,
     logout, refresh_session, registration_status, issue_ws_crypto_key, remove_profile_banner, remove_profile_image, request_account_deletion, cancel_account_deletion, revoke_all_sessions, revoke_other_sessions, revoke_session, setup_two_factor, signup,
-    update_availability_status, update_language, update_profile, verify_two_factor_login,
+    update_language, update_profile, verify_two_factor_login,
 };
 use crate::middlewares::signup::registration_closed;
 use crate::controllers::announcements::{dismiss_announcements, get_my_announcements};
@@ -24,7 +24,7 @@ use crate::middlewares::auth::{
 };
 use crate::middlewares::captcha::verify_turnstile_token;
 use crate::middlewares::validation::validate_password;
-use crate::utils::ratelimit::{change_password_limiter, change_username_limiter, login_limiter, refresh_limiter, signup_limiter, status_update_limiter, two_factor_login_limiter, two_factor_mutation_limiter, upload_limiter};
+use crate::utils::ratelimit::{change_password_limiter, change_username_limiter, login_limiter, refresh_limiter, signup_limiter, two_factor_login_limiter, two_factor_mutation_limiter, upload_limiter};
 
 #[derive(MultipartForm)]
 pub struct ProfileImageForm {
@@ -209,21 +209,6 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .wrap(from_fn(verify_token))
             .route(web::patch().to(update_language)),
     );
-    cfg.service(
-        web::resource("/availability-status")
-            .wrap(from_fn(require_active_account))
-            .wrap(from_fn(verify_token))
-            .wrap(from_fn(status_update_limiter))
-            .route(web::post().to(update_availability_status)),
-    );
-    cfg.service(
-        web::resource("/status")
-            .wrap(from_fn(require_active_account))
-            .wrap(from_fn(verify_token))
-            .wrap(from_fn(status_update_limiter))
-            .route(web::post().to(update_availability_status)),
-    );
-
     cfg.service(
         web::resource("/add-profile-image")
             .wrap(from_fn(log_suspicious_activity("profile-image-upload")))
