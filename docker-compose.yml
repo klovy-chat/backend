@@ -1,15 +1,57 @@
-version: '3.8'
+version: "3.8"
 
 services:
-  backend:
+  backend1:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: klovy-chat-backend
+    container_name: klovy-chat-backend1
     restart: always
     env_file:
       - .env
-    network_mode: "host"  # Umożliwia łatwy dostęp do bazy i tunelu na VPS
+    environment:
+      PORT: 6700
+      INTERNAL_HTTP_PORT: 6705
+    network_mode: "host"
+
+  backend2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: klovy-chat-backend2
+    restart: always
+    env_file:
+      - .env
+    environment:
+      PORT: 6701
+      INTERNAL_HTTP_PORT: 6706
+    network_mode: "host"
+
+  backend3:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: klovy-chat-backend3
+    restart: always
+    env_file:
+      - .env
+    environment:
+      PORT: 6702
+      INTERNAL_HTTP_PORT: 6707
+    network_mode: "host"
+
+  backend4:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: klovy-chat-backend4
+    restart: always
+    env_file:
+      - .env
+    environment:
+      PORT: 6703
+      INTERNAL_HTTP_PORT: 6708
+    network_mode: "host"
 
   clamav:
     image: clamav/clamav:1.4

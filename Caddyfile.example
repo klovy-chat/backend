@@ -1,8 +1,5 @@
-# Example reverse proxy (Caddy).
-# Copy: cp Caddyfile.example Caddyfile
-# Replace app.example.com, ChatApp, and log paths before use.
-# Backend listens on :8080. This file binds :8081 in front of it.
-
+# Production-style example. Backend and listener ports are placeholders;
+# align them with your own deployment instead of copying production port values.
 {
 	auto_https off
 	admin off
@@ -44,8 +41,15 @@
 }
 
 (reverse_http) {
-	reverse_proxy 0.0.0.0:8080 {
+	reverse_proxy 127.0.0.1:7000 127.0.0.1:7001 127.0.0.1:7002 127.0.0.1:7003 {
 		import proxy_headers
+
+		lb_policy        least_conn
+		lb_try_duration  3s
+		lb_try_interval  250ms
+
+		fail_duration    10s
+		max_fails        2
 
 		transport http {
 			versions                1.1
@@ -60,12 +64,19 @@
 }
 
 (reverse_ws) {
-	reverse_proxy 0.0.0.0:8080 {
+	reverse_proxy 127.0.0.1:7000 127.0.0.1:7001 127.0.0.1:7002 127.0.0.1:7003 {
 		import proxy_headers
 		header_up Connection {http.request.header.Connection}
 		header_up Upgrade    {http.request.header.Upgrade}
 
 		flush_interval -1
+
+		lb_policy        least_conn
+		lb_try_duration  3s
+		lb_try_interval  250ms
+
+		fail_duration    10s
+		max_fails        2
 
 		transport http {
 			versions      1.1
@@ -80,18 +91,18 @@
 	header {
 		-Server
 		Content-Type                     application/json
-		Access-Control-Allow-Origin      "https://app.example.com"
+		Access-Control-Allow-Origin      "https://app.klovy.chat"
 		Access-Control-Allow-Credentials "true"
 		Vary                             Origin
 		Strict-Transport-Security        "max-age=15552000; includeSubDomains"
 	}
 }
 
-:8081 {
+:7010 {
 	bind 0.0.0.0
 
 	log {
-		output file /var/log/caddy/api.example.com.log {
+		output file /var/log/caddy/api.klovy.chat.log {
 			roll_size     50mb
 			roll_keep     5
 			roll_keep_for 720h
@@ -114,10 +125,10 @@
 		Strict-Transport-Security "max-age=15552000; includeSubDomains"
 	}
 
-	@corsOrigin header Origin https://app.example.com
+	@corsOrigin header Origin https://app.klovy.chat
 	header @corsOrigin {
 		defer
-		Access-Control-Allow-Origin      "https://app.example.com"
+		Access-Control-Allow-Origin      "https://app.klovy.chat"
 		Access-Control-Allow-Credentials "true"
 	}
 
@@ -142,12 +153,12 @@
 		not method OPTIONS
 		not path / /api /api/ /ws
 		not path /api/security /api/security/*
-		not header X-App-Client ChatApp*
+		not header X-Klovy-Client KlovyChatApp*
 	}
 
 	@wsNoClient {
 		path /ws
-		not query client=ChatApp
+		not query client=KlovyChatApp
 	}
 
 	@readOnly {
@@ -157,7 +168,7 @@
 
 	@corsPreflight {
 		method OPTIONS
-		header Origin https://app.example.com
+		header Origin https://app.klovy.chat
 	}
 
 	rate_limit {
@@ -233,10 +244,10 @@
 		error @badWS         "Unsupported client" 400
 
 		header @corsPreflight {
-			Access-Control-Allow-Origin      "https://app.example.com"
+			Access-Control-Allow-Origin      "https://app.klovy.chat"
 			Access-Control-Allow-Credentials "true"
 			Access-Control-Allow-Methods     "GET, POST, PUT, PATCH, DELETE, OPTIONS"
-			Access-Control-Allow-Headers     "Content-Type, Authorization, Accept, Accept-Language, Accept-Encoding, X-Requested-With, X-CSRF-Token, X-Client-Version, X-App-Client, X-App-User-Agent"
+			Access-Control-Allow-Headers     "Content-Type, Authorization, Accept, Accept-Language, Accept-Encoding, X-Requested-With, X-CSRF-Token, X-Client-Version, X-Klovy-Client, X-Klovy-User-Agent"
 			Access-Control-Max-Age           "86400"
 			Vary                             Origin
 		}

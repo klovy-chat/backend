@@ -63,17 +63,17 @@ W `.env` wstaw swój connection string **MongoDB Atlas** (`MONGODB_URI`). Potem:
 cargo run
 ```
 
-Szablon [`.env.example`](.env.example) ma gotowe wartości na `127.0.0.1` (port `8080`, klucze dev). Turnstile i ClamAV w `development` nie są wymagane. Upload załączników potrzebuje prawdziwego Cloudflare R2 — dummy `R2_*` wystarcza, żeby proces wstał.
+Szablon [`.env.example`](.env.example) ma gotowe wartości na `127.0.0.1` (port `7000`, klucze dev). Turnstile i ClamAV w `development` nie są wymagane. Upload załączników potrzebuje prawdziwego Cloudflare R2 — dummy `R2_*` wystarcza, żeby proces wstał.
 
 Opcjonalny skaner:
 
 ```bash
-docker compose --profile scan up -d
+docker compose --profile scan up -d clamav
 ```
 
 W `.env` ustaw wtedy `CLAMAV_HOST=127.0.0.1:3310`.
 
-Przykładowy reverse proxy: [Caddyfile.example](Caddyfile.example) (`cp Caddyfile.example Caddyfile`). Podmień `app.example.com` i `ChatApp` na swoje wartości. Caddy na `:8081` → backend na `:8080`.
+Przykład Caddy dla czterech instancji: [Caddyfile.example](Caddyfile.example). Używa przykładowych portów `7000–7003` dla backendów i `7010` dla Caddy — przed wdrożeniem dopasuj je do własnej konfiguracji, domenę, log path, listę zaufanych proxy oraz reguły firewalla. Nie dodawaj adresu do `trusted_proxies`, jeśli nie należy do kontrolowanego przez Ciebie reverse proxy. Lokalnie wystarczy uruchomić backend bez Caddy przez `cargo run`.
 
 Build produkcyjny:
 
@@ -89,16 +89,16 @@ cargo build --release
 Skaner (opcjonalnie):
 
 ```bash
-docker compose --profile scan up -d
+docker compose --profile scan up -d clamav
 ```
 
-Pełny stack produkcyjny (obraz backendu + ClamAV):
+Pełny stack produkcyjny (cztery instancje backendu + ClamAV):
 
 ```bash
 docker compose --profile scan up -d --build
 ```
 
-Produkcja w oficjalnym repo jest wdrażana przez GitHub Actions (`.github/workflows/deploy.yml`) przy pushu na `main`. Forki tego nie robią.
+Push na `main` uruchamia GitHub Actions (`.github/workflows/deploy.yml`), które synchronizuje `docker-compose.yml` na VPS i uruchamia cztery instancje backendu oraz ClamAV. Forki tego nie robią.
 
 ---
 
@@ -154,7 +154,7 @@ backend/
 ├── .github/workflows/       # Deploy produkcyjny
 ├── docker-compose.yml
 ├── Dockerfile
-├── Caddyfile.example        # Przykładowy reverse proxy
+├── Caddyfile.example        # Przykładowy reverse proxy (porty przykładowe)
 ├── Cargo.toml
 └── .env.example             # Szablon środowiska (lokalny start)
 ```
