@@ -806,18 +806,23 @@ pub async fn delete_conversation(req: HttpRequest) -> HttpResponse {
 
     let wipe_at = DateTime::now();
 
-    let live_filter = doc! {
+    let conversation_files_filter = doc! {
         "$or": [
             { "sender": uid, "recipient": cid },
             { "sender": cid, "recipient": uid },
         ],
-        "deleted": { "$ne": true },
+        "fileUrl": { "$exists": true, "$ne": null },
     };
-    let file_urls = match crate::utils::messages::search::wipe_live_messages(&db, live_filter).await {
+    let mut file_urls = match crate::utils::messages::search::message_file_urls(
+        &db,
+        conversation_files_filter,
+    )
+    .await
+    {
         Ok(urls) => urls,
         Err(e) => {
             log::error!(
-                "delete_conversation: failed to wipe DM messages for {} / {}: {e}",
+                "delete_conversation: failed to read attachment URLs for {} / {}: {e}",
                 user_id,
                 contact_id
             );
@@ -827,12 +832,45 @@ pub async fn delete_conversation(req: HttpRequest) -> HttpResponse {
             }));
         }
     };
+    let live_filter = doc! {
+        "$or": [
+            { "sender": uid, "recipient": cid },
+            { "sender": cid, "recipient": uid },
+        ],
+        "deleted": { "$ne": true },
+    };
+    let live_file_urls =
+        match crate::utils::messages::search::wipe_live_messages(&db, live_filter).await {
+            Ok(urls) => urls,
+            Err(e) => {
+                log::error!(
+                    "delete_conversation: failed to wipe DM messages for {} / {}: {e}",
+                    user_id,
+                    contact_id
+                );
+                return HttpResponse::ServiceUnavailable().json(json!({
+                    "message": "Failed to delete conversation",
+                    "retryable": true,
+                }));
+            }
+        };
+    file_urls.extend(live_file_urls);
+    file_urls.sort();
+    file_urls.dedup();
 
     let cleanups: Vec<_> = file_urls
         .iter()
         .map(|url| cleanup_attachment_if_unreferenced(&db, Some(url)))
         .collect();
-    futures_util::future::join_all(cleanups).await;
+    for result in futures_util::future::join_all(cleanups).await {
+        if let Err(e) = result {
+            log::error!("Failed to clean up deleted conversation attachment: {e}");
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "message": "Conversation messages were deleted, but attachment cleanup is incomplete.",
+                "retryable": true,
+            }));
+        }
+    }
 
     if let Some(session) =
         crate::utils::voice::calls::take_session_for_pair(&user_id, contact_id)

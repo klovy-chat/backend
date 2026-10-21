@@ -23,6 +23,7 @@ use crate::utils::validators::unicode::sanitize_channel_name;
 use crate::model::channels::{Channel, CreateChannelInput};
 use crate::model::reports::{ChannelReport, CreateChannelReportInput};
 use crate::model::messages::Message;
+use crate::model::storage_cleanup::{PendingStorageDeletion, StorageObjectKind};
 use crate::model::users::User;
 use crate::utils::channel::{
     can_access_channel, channel_member_count, enrich_channel_unread, enrich_channels_batch,
@@ -738,7 +739,22 @@ pub async fn delete_channel_avatar(req: HttpRequest) -> HttpResponse {
     if !channel.image.is_empty() {
         let channel_id = cid.to_hex();
         if avatar_key_owned_by_channel(&channel.image, &channel_id) {
-            let _ = storage().delete_avatar_key(&channel.image).await;
+            if let Err(error) = PendingStorageDeletion::delete_or_defer(
+                &db,
+                &channel.image,
+                StorageObjectKind::Avatar,
+            )
+            .await
+            {
+                log::error!(
+                    "Failed to schedule cleanup for deleted channel avatar {}: {error}",
+                    channel.image
+                );
+                return HttpResponse::ServiceUnavailable().json(json!({
+                    "message": "Channel avatar cleanup is pending.",
+                    "retryable": true,
+                }));
+            }
         }
         match Channel::collection(&db)
             .update_one(
@@ -848,7 +864,15 @@ pub async fn upload_channel_avatar(
     {
         Ok(_) => {}
         Err(_) => {
-            let _ = storage().delete_avatar_key(&key).await;
+            if let Err(cleanup_error) = PendingStorageDeletion::delete_or_defer(
+                &db,
+                &key,
+                StorageObjectKind::Avatar,
+            )
+            .await
+            {
+                log::error!("Failed to schedule cleanup for unreferenced channel avatar {key}: {cleanup_error}");
+            }
             return HttpResponse::InternalServerError().json(json!({
                 "message": "Failed to update channel avatar",
                 "retryable": true,
@@ -856,11 +880,23 @@ pub async fn upload_channel_avatar(
         }
     }
 
+    let mut cleanup_error = None;
     if !previous_image.is_empty()
         && previous_image != key
         && avatar_key_owned_by_channel(&previous_image, &channel_id)
     {
-        let _ = storage().delete_avatar_key(&previous_image).await;
+        if let Err(error) = PendingStorageDeletion::delete_or_defer(
+            &db,
+            &previous_image,
+            StorageObjectKind::Avatar,
+        )
+        .await
+        {
+            log::error!(
+                "Failed to schedule cleanup for previous channel avatar {previous_image}: {error}"
+            );
+            cleanup_error = Some(error);
+        }
     }
 
     emit_to_users(
@@ -868,6 +904,12 @@ pub async fn upload_channel_avatar(
         "channel-avatar-updated",
         json!({ "channelId": channel_id, "image": key }),
     );
+    if cleanup_error.is_some() {
+        return HttpResponse::ServiceUnavailable().json(json!({
+            "message": "Channel avatar updated, but old avatar cleanup is pending.",
+            "retryable": true,
+        }));
+    }
     HttpResponse::Ok().json(json!({ "message": "Avatar updated", "image": key }))
 }
 
@@ -1127,7 +1169,26 @@ pub async fn delete_channel(req: HttpRequest) -> HttpResponse {
         "channel": cid,
         "deleted": { "$ne": true },
     };
-    let file_urls = match crate::utils::messages::search::wipe_live_messages(&db, live_filter).await {
+    let all_channel_files_filter = doc! {
+        "channel": cid,
+        "fileUrl": { "$exists": true, "$ne": null },
+    };
+    let mut file_urls = match crate::utils::messages::search::message_file_urls(
+        &db,
+        all_channel_files_filter,
+    )
+    .await
+    {
+        Ok(urls) => urls,
+        Err(e) => {
+            log::error!("delete_channel: failed to read attachment URLs for {channel_id}: {e}");
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "message": "Failed to delete channel",
+                "retryable": true,
+            }));
+        }
+    };
+    let live_file_urls = match crate::utils::messages::search::wipe_live_messages(&db, live_filter).await {
         Ok(urls) => urls,
         Err(e) => {
             log::error!("delete_channel: failed to wipe messages for {channel_id}: {e}");
@@ -1137,20 +1198,45 @@ pub async fn delete_channel(req: HttpRequest) -> HttpResponse {
             }));
         }
     };
+    file_urls.extend(live_file_urls);
+    file_urls.sort();
+    file_urls.dedup();
     let cleanups: Vec<_> = file_urls
         .iter()
         .map(|url| {
             crate::utils::messages::access::cleanup_attachment_if_unreferenced(&db, Some(url))
         })
         .collect();
-    futures_util::future::join_all(cleanups).await;
+    for result in futures_util::future::join_all(cleanups).await {
+        if let Err(e) = result {
+            log::error!("delete_channel: attachment cleanup failed for {channel_id}: {e}");
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "message": "Channel messages were deleted, but attachment cleanup is incomplete.",
+                "retryable": true,
+            }));
+        }
+    }
 
-    let _ = crate::model::invites::Invite::collection(&db)
+    if let Err(e) = crate::model::invites::Invite::collection(&db)
         .delete_many(doc! { "channelId": cid })
-        .await;
-    let _ = crate::model::read_state::ChannelReadState::collection(&db)
+        .await
+    {
+        log::error!("delete_channel: failed to delete invites for {channel_id}: {e}");
+        return HttpResponse::ServiceUnavailable().json(json!({
+            "message": "Failed to delete channel",
+            "retryable": true,
+        }));
+    }
+    if let Err(e) = crate::model::read_state::ChannelReadState::collection(&db)
         .delete_many(doc! { "channelId": cid })
-        .await;
+        .await
+    {
+        log::error!("delete_channel: failed to delete read states for {channel_id}: {e}");
+        return HttpResponse::ServiceUnavailable().json(json!({
+            "message": "Failed to delete channel",
+            "retryable": true,
+        }));
+    }
 
     match Channel::collection(&db).delete_one(doc! { "_id": cid }).await {
         Ok(r) if r.deleted_count > 0 => {}

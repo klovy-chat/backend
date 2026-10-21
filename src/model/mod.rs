@@ -21,4 +21,5 @@ pub mod uploads;
 pub mod refresh_tokens;
 pub mod users;
 pub mod storage_usage;
+pub mod storage_cleanup;
 pub mod warnings;

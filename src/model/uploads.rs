@@ -168,28 +168,47 @@ impl PendingUpload {
 
         let mut removed = 0u64;
         for entry in entries {
-            let size = if entry.file_size > 0 {
-                entry.file_size
-            } else {
-                crate::utils::storage::storage()
-                    .head_attachment_content_length(&entry.file_path)
-                    .await
-                    .ok()
-                    .flatten()
-                    .unwrap_or(0)
-            };
+            let object_size = crate::utils::storage::storage()
+                .head_attachment_content_length(&entry.file_path)
+                .await
+                .map_err(|error| {
+                    mongodb::error::Error::custom(format!(
+                        "inspect orphaned upload {}: {error}",
+                        entry.file_path
+                    ))
+                })?;
 
-            let _ = crate::utils::storage::storage()
+            crate::utils::storage::storage()
                 .delete_attachment_key(&entry.file_path)
-                .await;
+                .await
+                .map_err(|error| {
+                    mongodb::error::Error::custom(format!(
+                        "delete orphaned upload {}: {error}",
+                        entry.file_path
+                    ))
+                })?;
 
-            if size > 0 {
-                let _ = crate::model::storage_usage::UserStorageUsage::adjust(
-                    db,
-                    entry.user_id,
-                    -(size as i64),
-                )
-                .await;
+            // Do not decrement usage for an object already deleted by an earlier attempt.
+            if let Some(object_size) = object_size {
+                let size = if entry.file_size > 0 {
+                    entry.file_size
+                } else {
+                    object_size
+                };
+                if size > 0 {
+                    crate::model::storage_usage::UserStorageUsage::adjust(
+                        db,
+                        entry.user_id,
+                        -(size as i64),
+                    )
+                    .await
+                    .map_err(|error| {
+                        mongodb::error::Error::custom(format!(
+                            "adjust storage usage for orphaned upload {}: {error}",
+                            entry.file_path
+                        ))
+                    })?;
+                }
             }
 
             if let Some(id) = entry.id {

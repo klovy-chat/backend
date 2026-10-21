@@ -24,6 +24,7 @@ const QUARANTINE_PREFIX: &str = "quarantine/";
 pub enum StorageError {
     NotConfigured(String),
     InitFailed(String),
+    DatabaseFailed(String),
     OperationFailed(String),
 }
 
@@ -32,6 +33,7 @@ impl std::fmt::Display for StorageError {
         match self {
             Self::NotConfigured(msg) => write!(f, "Storage not configured: {msg}"),
             Self::InitFailed(msg) => write!(f, "Storage init failed: {msg}"),
+            Self::DatabaseFailed(msg) => write!(f, "Storage database operation failed: {msg}"),
             Self::OperationFailed(msg) => write!(f, "Storage operation failed: {msg}"),
         }
     }
@@ -322,9 +324,7 @@ impl R2Storage {
         match self.head_public_content_length(logical_key).await {
             Ok(Some(len)) => return Ok(Some(len)),
             Ok(None) => {}
-            Err(err) => {
-                log::warn!("public HEAD {logical_key} failed, trying quarantine: {err}");
-            }
+            Err(err) => return Err(err),
         }
         let object_key = self.quarantine_object_key(logical_key);
         self.head_bucket_key(&self.quarantine_bucket, &object_key)
@@ -355,13 +355,23 @@ impl R2Storage {
         if !crate::utils::storage::is_attachment_key(key) {
             return Ok(());
         }
-        let result = self.delete_public(key).await;
-        let _ = self.delete_quarantine(key).await;
-        if let Some(thumb) = crate::utils::storage::attachment_thumb_key(key) {
-            let _ = self.delete_public(&thumb).await;
-            let _ = self.delete_quarantine(&thumb).await;
+        let mut first_error = None;
+        for result in [self.delete_public(key).await, self.delete_quarantine(key).await] {
+            if let Err(error) = result {
+                first_error.get_or_insert(error);
+            }
         }
-        result
+        if let Some(thumb) = crate::utils::storage::attachment_thumb_key(key) {
+            for result in [
+                self.delete_public(&thumb).await,
+                self.delete_quarantine(&thumb).await,
+            ] {
+                if let Err(error) = result {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     pub async fn delete_avatar_key(&self, key: &str) -> Result<(), StorageError> {

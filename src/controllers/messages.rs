@@ -380,12 +380,20 @@ pub async fn upload_file(req: HttpRequest, form: MultipartForm<UploadFileForm>) 
             .await
         {
             log::error!("put_quarantine thumb {thumb_key} failed: {err}");
-            let _ = storage().delete_attachment_key(&logical_path).await;
+            if let Err(cleanup_error) = storage().delete_attachment_key(&logical_path).await {
+                log::error!(
+                    "Failed to roll back attachment {logical_path} after thumbnail upload failure: {cleanup_error}"
+                );
+                return HttpResponse::ServiceUnavailable().json(json!({
+                    "message": "Upload failed and storage cleanup is pending.",
+                    "retryable": true,
+                }));
+            }
             return HttpResponse::InternalServerError().body("Internal Server Error.");
         }
     }
 
-    if PendingUpload::register(
+    if let Err(register_error) = PendingUpload::register(
         &db,
         user_oid,
         &logical_path,
@@ -397,26 +405,56 @@ pub async fn upload_file(req: HttpRequest, form: MultipartForm<UploadFileForm>) 
         ScanStatus::Pending,
     )
     .await
-    .is_err()
     {
-        let _ = storage().delete_attachment_key(&logical_path).await;
-        if PendingUpload::count_for_user(&db, user_oid)
-            .await
-            .map(|count| count >= crate::utils::upload::MAX_PENDING_UPLOADS_PER_USER)
-            .unwrap_or(false)
-        {
-            return HttpResponse::TooManyRequests()
-                .body("Too many pending uploads. Send or wait before uploading more.");
+        if let Err(cleanup_error) = storage().delete_attachment_key(&logical_path).await {
+            log::error!(
+                "Failed to roll back unregistered attachment {logical_path}: {cleanup_error}"
+            );
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "message": "Upload registration failed and storage cleanup is pending.",
+                "retryable": true,
+            }));
         }
+        match PendingUpload::count_for_user(&db, user_oid).await {
+            Ok(count) if count >= crate::utils::upload::MAX_PENDING_UPLOADS_PER_USER => {
+                return HttpResponse::TooManyRequests()
+                    .body("Too many pending uploads. Send or wait before uploading more.");
+            }
+            Ok(_) => {}
+            Err(error) => {
+                log::error!("Failed to inspect pending uploads after registration error: {error}");
+                return HttpResponse::ServiceUnavailable().json(json!({
+                    "message": "Temporarily unavailable.",
+                    "retryable": true,
+                }));
+            }
+        }
+        log::error!("Failed to register pending attachment {logical_path}: {register_error}");
         return HttpResponse::InternalServerError().body("Internal Server Error.");
     }
 
-    if UserStorageUsage::adjust(&db, user_oid, total_stored as i64)
-        .await
-        .is_err()
-    {
-        let _ = storage().delete_attachment_key(&logical_path).await;
-        let _ = PendingUpload::claim_by_path(&db, user_oid, &logical_path).await;
+    if let Err(usage_error) = UserStorageUsage::adjust(&db, user_oid, total_stored as i64).await {
+        log::error!("Failed to account uploaded attachment {logical_path}: {usage_error}");
+        if let Err(cleanup_error) = storage().delete_attachment_key(&logical_path).await {
+            log::error!(
+                "Failed to roll back attachment {logical_path} after storage accounting failure: {cleanup_error}"
+            );
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "message": "Upload accounting failed and storage cleanup is pending.",
+                "retryable": true,
+            }));
+        }
+        if let Err(pending_error) =
+            PendingUpload::claim_by_path(&db, user_oid, &logical_path).await
+        {
+            log::error!(
+                "Failed to remove pending upload {logical_path} after rollback: {pending_error}"
+            );
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "message": "Upload accounting failed and rollback is incomplete.",
+                "retryable": true,
+            }));
+        }
         return HttpResponse::InternalServerError().body("Internal Server Error.");
     }
 
@@ -859,10 +897,17 @@ pub async fn delete_message(req: HttpRequest) -> HttpResponse {
             }));
         }
     };
-    let crate::model::messages::SoftDeleteOutcome::Deleted { was_unread } = outcome else {
-        return HttpResponse::Ok().json(json!({ "success": true }));
+    let was_unread = match outcome {
+        crate::model::messages::SoftDeleteOutcome::Deleted { was_unread } => was_unread,
+        crate::model::messages::SoftDeleteOutcome::AlreadyDeleted => false,
     };
-    cleanup_attachment_if_unreferenced(&db, message.file_url.as_deref()).await;
+    if let Err(e) = cleanup_attachment_if_unreferenced(&db, message.file_url.as_deref()).await {
+        log::error!("Failed to clean up deleted message attachment {message_id}: {e}");
+        return HttpResponse::ServiceUnavailable().json(json!({
+            "error": "Message was deleted, but attachment cleanup is incomplete.",
+            "retryable": true,
+        }));
+    }
     if let Some(channel_id) = message.channel {
         crate::utils::tips::refresh_channel_tip_after_delete(&db, channel_id, mid)
             .await;

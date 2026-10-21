@@ -40,6 +40,29 @@ fn db_error_retryable(context: &str, e: impl std::fmt::Display) -> HttpResponse 
     }))
 }
 
+async fn refund_invite_use(
+    db: &mongodb::Database,
+    invite_id: &str,
+    reservation_id: &str,
+) -> Result<(), HttpResponse> {
+    for attempt in 0..2 {
+        match Invite::release_use(db, invite_id, reservation_id).await {
+            Ok(()) => return Ok(()),
+            Err(error) if attempt == 0 => {
+                log::warn!("Invite-use refund attempt failed for {invite_id}: {error}");
+            }
+            Err(error) => {
+                log::error!("Failed to refund invite use for {invite_id}: {error}");
+                return Err(HttpResponse::ServiceUnavailable().json(json!({
+                    "error": "Invite use could not be refunded",
+                    "retryable": true,
+                })));
+            }
+        }
+    }
+    unreachable!()
+}
+
 fn frontend_origin(req: &HttpRequest) -> String {
     let origin = if crate::utils::env::is_production() {
         std::env::var("FRONTEND_URL").unwrap_or_else(|_| "http://127.0.0.1:5173".to_string())
@@ -287,30 +310,42 @@ pub async fn accept_invite(req: HttpRequest) -> HttpResponse {
         }));
     }
 
-    let consumed = match Invite::try_register_use(&db, invite_id).await {
+    let reservation_id = uuid::Uuid::new_v4().to_string();
+    let consumed = match Invite::try_register_use(&db, invite_id, &reservation_id).await {
         Ok(Some(i)) => i,
         Ok(None) => {
             return HttpResponse::BadRequest().json(
                 json!({ "error": "Zaproszenie zostało wyłączone, wygasło lub osiągnęło limit" }),
             )
         }
-        Err(e) => return db_error("accept_invite: register use", e),
+        Err(e) => {
+            if let Err(response) = refund_invite_use(&db, invite_id, &reservation_id).await {
+                return response;
+            }
+            return db_error("accept_invite: register use", e);
+        }
     };
 
     let channel = match Channel::find_by_id(&db, consumed.channel_id).await {
         Ok(Some(c)) => c,
         Ok(None) => {
-            let _ = Invite::release_use(&db, invite_id).await;
+            if let Err(response) = refund_invite_use(&db, invite_id, &reservation_id).await {
+                return response;
+            }
             return HttpResponse::NotFound().json(json!({ "error": "Kanał nie istnieje" }));
         }
         Err(e) => {
-            let _ = Invite::release_use(&db, invite_id).await;
+            if let Err(response) = refund_invite_use(&db, invite_id, &reservation_id).await {
+                return response;
+            }
             return db_error_retryable("accept_invite: channel reload", e);
         }
     };
 
     if is_channel_banned(&channel, Some(&user_id)) {
-        let _ = Invite::release_use(&db, invite_id).await;
+        if let Err(response) = refund_invite_use(&db, invite_id, &reservation_id).await {
+            return response;
+        }
         return HttpResponse::Forbidden()
             .json(json!({ "error": "Nie masz dostępu do tego kanału" }));
     }
@@ -318,17 +353,23 @@ pub async fn accept_invite(req: HttpRequest) -> HttpResponse {
     let channel_id_hex = channel.id.map(|o| o.to_hex());
 
     let Ok(user_oid) = ObjectId::parse_str(&user_id) else {
-        let _ = Invite::release_use(&db, invite_id).await;
+        if let Err(response) = refund_invite_use(&db, invite_id, &reservation_id).await {
+            return response;
+        }
         return HttpResponse::BadRequest().json(json!({ "error": "Użytkownik nie istnieje" }));
     };
     match User::find_by_id(&db, user_oid).await {
         Ok(Some(_)) => {}
         Ok(None) => {
-            let _ = Invite::release_use(&db, invite_id).await;
+            if let Err(response) = refund_invite_use(&db, invite_id, &reservation_id).await {
+                return response;
+            }
             return HttpResponse::BadRequest().json(json!({ "error": "Użytkownik nie istnieje" }));
         }
         Err(_) => {
-            let _ = Invite::release_use(&db, invite_id).await;
+            if let Err(response) = refund_invite_use(&db, invite_id, &reservation_id).await {
+                return response;
+            }
             return HttpResponse::ServiceUnavailable().json(json!({
                 "error": "Temporarily unavailable",
                 "retryable": true,
@@ -337,22 +378,26 @@ pub async fn accept_invite(req: HttpRequest) -> HttpResponse {
     }
 
     let Some(channel_oid) = channel.id else {
-        let _ = Invite::release_use(&db, invite_id).await;
+        if let Err(response) = refund_invite_use(&db, invite_id, &reservation_id).await {
+            return response;
+        }
         return HttpResponse::InternalServerError().json(json!({
             "error": "Kanał nie istnieje",
             "retryable": true,
         }));
     };
 
-    if crate::model::read_state::ChannelReadState::seed_if_missing(
+    if let Err(error) = crate::model::read_state::ChannelReadState::seed_if_missing(
         &db,
         user_oid,
         channel_oid,
     )
     .await
-    .is_err()
     {
-        let _ = Invite::release_use(&db, invite_id).await;
+        log::error!("Failed to seed channel read state during invite acceptance: {error}");
+        if let Err(response) = refund_invite_use(&db, invite_id, &reservation_id).await {
+            return response;
+        }
         return HttpResponse::ServiceUnavailable().json(json!({
             "error": "Temporarily unavailable",
             "retryable": true,
@@ -367,19 +412,32 @@ pub async fn accept_invite(req: HttpRequest) -> HttpResponse {
         .await;
     let modified = match res {
         Ok(r) => r.modified_count,
-        Err(_) => {
-            let _ = Invite::release_use(&db, invite_id).await;
+        Err(error) => {
+            log::error!("Failed to add invitee to channel: {error}");
+            if let Err(response) = refund_invite_use(&db, invite_id, &reservation_id).await {
+                return response;
+            }
             return HttpResponse::InternalServerError()
                 .json(json!({ "error": "Internal Server Error", "retryable": true }));
         }
     };
 
     if modified == 0 {
-        let _ = Invite::release_use(&db, invite_id).await;
+        if let Err(response) = refund_invite_use(&db, invite_id, &reservation_id).await {
+            return response;
+        }
         return HttpResponse::Ok().json(json!({
             "success": true,
             "channelId": channel_id_hex,
             "alreadyMember": true,
+        }));
+    }
+
+    if let Err(error) = Invite::commit_use(&db, invite_id, &reservation_id).await {
+        log::error!("Failed to commit invite-use reservation for {invite_id}: {error}");
+        return HttpResponse::ServiceUnavailable().json(json!({
+            "error": "Membership was added, but invite usage finalization is pending",
+            "retryable": true,
         }));
     }
 

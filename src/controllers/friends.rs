@@ -724,6 +724,75 @@ pub async fn remove_friend(req: HttpRequest) -> HttpResponse {
             .json(json!({ "error": "Ten użytkownik nie jest w Twoich kontaktach." }));
     };
 
+    use crate::model::messages::Message;
+    use crate::utils::messages::access::cleanup_attachment_if_unreferenced;
+
+    let wipe_at = DateTime::now();
+    let conversation_filter = doc! {
+        "$or": [
+            { "sender": user_oid, "recipient": friend_oid },
+            { "sender": friend_oid, "recipient": user_oid },
+        ],
+    };
+    let mut file_urls = match crate::utils::messages::search::message_file_urls(
+        &db,
+        conversation_filter,
+    )
+    .await
+    {
+        Ok(urls) => urls,
+        Err(e) => {
+            log::error!(
+                "remove_friend: failed to read attachment URLs for {} / {}: {e}",
+                user_id,
+                friend_user_id
+            );
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "error": "Failed to remove friend",
+                "retryable": true,
+            }));
+        }
+    };
+    let dm_filter = doc! {
+        "$or": [
+            { "sender": user_oid, "recipient": friend_oid },
+            { "sender": friend_oid, "recipient": user_oid },
+        ],
+        "deleted": { "$ne": true },
+    };
+    let live_file_urls =
+        match crate::utils::messages::search::wipe_live_messages(&db, dm_filter).await {
+            Ok(urls) => urls,
+            Err(e) => {
+                log::error!(
+                    "remove_friend: failed to wipe DM messages for {} / {}: {e}",
+                    user_id,
+                    friend_user_id
+                );
+                return HttpResponse::ServiceUnavailable().json(json!({
+                    "error": "Failed to remove friend",
+                    "retryable": true,
+                }));
+            }
+        };
+    file_urls.extend(live_file_urls);
+    file_urls.sort();
+    file_urls.dedup();
+    let cleanups: Vec<_> = file_urls
+        .iter()
+        .map(|url| cleanup_attachment_if_unreferenced(&db, Some(url)))
+        .collect();
+    for result in futures_util::future::join_all(cleanups).await {
+        if let Err(e) = result {
+            log::error!("Failed to clean up removed friendship attachment: {e}");
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "error": "Messages were deleted, but attachment cleanup is incomplete.",
+                "retryable": true,
+            }));
+        }
+    }
+    crate::utils::tips::clear_dm_tip_at_most(&db, user_oid, friend_oid, wipe_at).await;
+
     match col.delete_one(doc! { "_id": friendship.id.unwrap_or_default() }).await {
         Ok(r) if r.deleted_count > 0 => {}
         Ok(_) => {
@@ -773,11 +842,6 @@ pub async fn remove_friend(req: HttpRequest) -> HttpResponse {
         }
     }
 
-    use crate::model::messages::Message;
-    use crate::utils::messages::access::cleanup_attachment_if_unreferenced;
-
-    let wipe_at = DateTime::now();
-
     crate::ws::registry::emit_to_user(
         &user_id,
         "friendship-removed",
@@ -789,37 +853,7 @@ pub async fn remove_friend(req: HttpRequest) -> HttpResponse {
         json!({ "userId": user_id }),
     );
 
-    let dm_filter = doc! {
-        "$or": [
-            { "sender": user_oid, "recipient": friend_oid },
-            { "sender": friend_oid, "recipient": user_oid },
-        ],
-        "deleted": { "$ne": true },
-    };
-    let wipe_ok = match crate::utils::messages::search::wipe_live_messages(&db, dm_filter).await {
-        Ok(urls) => {
-            let cleanups: Vec<_> = urls
-                .iter()
-                .map(|url| cleanup_attachment_if_unreferenced(&db, Some(url)))
-                .collect();
-            futures_util::future::join_all(cleanups).await;
-            crate::utils::tips::clear_dm_tip_at_most(
-                &db, user_oid, friend_oid, wipe_at,
-            )
-            .await;
-            true
-        }
-        Err(e) => {
-            log::error!(
-                "remove_friend: failed to wipe DM messages for {} / {}: {e}",
-                user_id,
-                friend_user_id
-            );
-            false
-        }
-    };
-
-    if wipe_ok {
+    {
         match Message::collection(&db)
             .count_documents(doc! {
                 "$or": [

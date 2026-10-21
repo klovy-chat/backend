@@ -42,6 +42,9 @@ pub struct Invite {
     #[serde(rename = "useCount", default)]
     pub use_count: u32,
 
+    #[serde(rename = "pendingUseIds", default)]
+    pub pending_use_ids: Vec<String>,
+
     #[serde(rename = "maxUses", skip_serializing_if = "Option::is_none")]
     pub max_uses: Option<u32>,
 
@@ -91,6 +94,7 @@ impl Invite {
             expires_at,
             used: false,
             use_count: 0,
+            pending_use_ids: Vec::new(),
             max_uses,
             revoked: false,
         };
@@ -136,6 +140,7 @@ impl Invite {
     pub async fn try_register_use(
         db: &Database,
         invite_id: &str,
+        reservation_id: &str,
     ) -> mongodb::error::Result<Option<Invite>> {
         let now = DateTime::now();
         let filter = doc! {
@@ -155,7 +160,10 @@ impl Invite {
                 ]},
             ],
         };
-        let update = doc! { "$inc": { "useCount": 1 } };
+        let update = doc! {
+            "$inc": { "useCount": 1 },
+            "$addToSet": { "pendingUseIds": reservation_id },
+        };
         let options = FindOneAndUpdateOptions::builder()
             .return_document(ReturnDocument::After)
             .build();
@@ -166,14 +174,38 @@ impl Invite {
             .await
     }
 
-    pub async fn release_use(db: &Database, invite_id: &str) -> mongodb::error::Result<()> {
+    pub async fn release_use(
+        db: &Database,
+        invite_id: &str,
+        reservation_id: &str,
+    ) -> mongodb::error::Result<()> {
         Self::collection(db)
             .update_one(
                 doc! {
                     "inviteId": invite_id,
-                    "useCount": { "$gt": 0 },
+                    "pendingUseIds": reservation_id,
                 },
-                doc! { "$inc": { "useCount": -1 } },
+                doc! {
+                    "$inc": { "useCount": -1 },
+                    "$pull": { "pendingUseIds": reservation_id },
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn commit_use(
+        db: &Database,
+        invite_id: &str,
+        reservation_id: &str,
+    ) -> mongodb::error::Result<()> {
+        Self::collection(db)
+            .update_one(
+                doc! {
+                    "inviteId": invite_id,
+                    "pendingUseIds": reservation_id,
+                },
+                doc! { "$pull": { "pendingUseIds": reservation_id } },
             )
             .await?;
         Ok(())

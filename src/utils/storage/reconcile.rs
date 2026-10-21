@@ -13,8 +13,8 @@ use mongodb::bson::{doc, oid::ObjectId};
 use mongodb::Database;
 
 use crate::model::messages::Message;
-use crate::model::uploads::PendingUpload;
 use crate::model::storage_usage::UserStorageUsage;
+use crate::model::uploads::PendingUpload;
 use crate::utils::storage::{is_attachment_key, storage, StorageError};
 
 #[derive(Debug, Default)]
@@ -27,7 +27,9 @@ pub struct ReconcileReport {
 pub async fn reconcile_attachments(db: &Database) -> Result<ReconcileReport, StorageError> {
     let mut report = ReconcileReport::default();
 
-    let referenced = collect_referenced_paths(db).await;
+    let referenced = collect_referenced_paths(db).await.map_err(|e| {
+        StorageError::DatabaseFailed(format!("attachment reference scan failed: {e}"))
+    })?;
     let public_objects = storage().list_public_attachments().await?;
     let quarantine_objects = storage().list_quarantine_attachments().await?;
 
@@ -60,37 +62,34 @@ pub async fn reconcile_attachments(db: &Database) -> Result<ReconcileReport, Sto
     Ok(report)
 }
 
-async fn collect_referenced_paths(db: &Database) -> HashSet<String> {
+async fn collect_referenced_paths(db: &Database) -> mongodb::error::Result<HashSet<String>> {
     let mut paths = HashSet::new();
 
-    if let Ok(cursor) = PendingUpload::collection(db).find(doc! {}).await {
-        if let Ok(entries) = cursor.try_collect::<Vec<PendingUpload>>().await {
-            for entry in entries {
-                paths.insert(entry.file_path);
-            }
-        }
+    let mut pending_cursor = PendingUpload::collection(db).find(doc! {}).await?;
+    while let Some(entry) = pending_cursor.try_next().await? {
+        paths.insert(entry.file_path);
     }
 
-    if let Ok(cursor) = Message::collection(db)
+    let mut message_cursor = Message::collection(db)
         .find(doc! {
             "deleted": { "$ne": true },
             "fileUrl": { "$exists": true, "$ne": null },
         })
-        .await
-    {
-        if let Ok(messages) = cursor.try_collect::<Vec<Message>>().await {
-            for msg in messages {
-                if let Some(url) = msg.file_url {
-                    let normalized = url.trim().replace('\\', "/").trim_start_matches('/').to_string();
-                    if is_attachment_key(&normalized) {
-                        paths.insert(normalized);
-                    }
-                }
+        .await?;
+    while let Some(msg) = message_cursor.try_next().await? {
+        if let Some(url) = msg.file_url {
+            let normalized = url
+                .trim()
+                .replace('\\', "/")
+                .trim_start_matches('/')
+                .to_string();
+            if is_attachment_key(&normalized) {
+                paths.insert(normalized);
             }
         }
     }
 
-    paths
+    Ok(paths)
 }
 
 async fn rebuild_user_storage_usage(db: &Database) -> mongodb::error::Result<u64> {

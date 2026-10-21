@@ -15,6 +15,7 @@ use serde_json::json;
 
 use crate::middlewares::auth::RequestUserId;
 use crate::model::refresh_tokens::RefreshToken;
+use crate::model::storage_cleanup::{PendingStorageDeletion, StorageObjectKind};
 use crate::model::users::{CreateUserInput, User, normalize_language};
 use crate::model::warnings::{severity_str, Warning};
 use crate::routes::auth::{ProfileBannerForm, ProfileImageForm};
@@ -1718,9 +1719,19 @@ pub async fn add_profile_image(
 
     match User::set_fields(&db, oid, doc! { "image": &key }).await {
         Ok(Some(user)) => {
+            let mut cleanup_error = None;
             if let Some(image) = previous_image {
                 if image != key && avatar_key_owned_by_user(&image, &user_id) {
-                    let _ = storage().delete_avatar_key(&image).await;
+                    if let Err(error) = PendingStorageDeletion::delete_or_defer(
+                        &db,
+                        &image,
+                        StorageObjectKind::Avatar,
+                    )
+                    .await
+                    {
+                        log::error!("Failed to schedule cleanup for previous profile image {image}: {error}");
+                        cleanup_error = Some(error);
+                    }
                 }
             }
             emit_profile_event(
@@ -1733,6 +1744,12 @@ pub async fn add_profile_image(
                 }),
             )
             .await;
+            if cleanup_error.is_some() {
+                return HttpResponse::ServiceUnavailable().json(json!({
+                    "message": "Profile image updated, but old image cleanup is pending.",
+                    "retryable": true,
+                }));
+            }
             HttpResponse::Ok().json(json!({ "image": user.image }))
         }
         Ok(None) => HttpResponse::NotFound().body("User not found."),
@@ -1761,8 +1778,18 @@ pub async fn remove_profile_image(req: HttpRequest) -> HttpResponse {
     if let Some(image) = &user.image {
         match User::set_fields(&db, oid, doc! { "image": Bson::Null }).await {
             Ok(Some(_)) => {
+                let mut cleanup_error = None;
                 if avatar_key_owned_by_user(image, &user_id) {
-                    let _ = storage().delete_avatar_key(image).await;
+                    if let Err(error) = PendingStorageDeletion::delete_or_defer(
+                        &db,
+                        image,
+                        StorageObjectKind::Avatar,
+                    )
+                    .await
+                    {
+                        log::error!("Failed to schedule cleanup for removed profile image {image}: {error}");
+                        cleanup_error = Some(error);
+                    }
                 }
                 emit_profile_event(
                     &db,
@@ -1774,6 +1801,12 @@ pub async fn remove_profile_image(req: HttpRequest) -> HttpResponse {
                     }),
                 )
                 .await;
+                if cleanup_error.is_some() {
+                    return HttpResponse::ServiceUnavailable().json(json!({
+                        "message": "Profile image was removed, but storage cleanup is pending.",
+                        "retryable": true,
+                    }));
+                }
             }
             Ok(None) => {
                 return HttpResponse::NotFound().json(json!({ "error": "User not found" }));
@@ -1838,9 +1871,19 @@ pub async fn add_profile_banner(
 
     match User::set_fields(&db, oid, doc! { "banner": &key }).await {
         Ok(Some(user)) => {
+            let mut cleanup_error = None;
             if let Some(banner) = previous_banner {
                 if banner != key && public_media_key_owned_by_user(&banner, &user_id) {
-                    let _ = storage().delete_public_media_key(&banner).await;
+                    if let Err(error) = PendingStorageDeletion::delete_or_defer(
+                        &db,
+                        &banner,
+                        StorageObjectKind::PublicMedia,
+                    )
+                    .await
+                    {
+                        log::error!("Failed to schedule cleanup for previous profile banner {banner}: {error}");
+                        cleanup_error = Some(error);
+                    }
                 }
             }
             emit_profile_event(
@@ -1853,6 +1896,12 @@ pub async fn add_profile_banner(
                 }),
             )
             .await;
+            if cleanup_error.is_some() {
+                return HttpResponse::ServiceUnavailable().json(json!({
+                    "message": "Profile banner updated, but old banner cleanup is pending.",
+                    "retryable": true,
+                }));
+            }
             HttpResponse::Ok().json(json!({ "banner": user.banner }))
         }
         Ok(None) => HttpResponse::NotFound().body("User not found."),
@@ -1881,8 +1930,18 @@ pub async fn remove_profile_banner(req: HttpRequest) -> HttpResponse {
     if let Some(banner) = &user.banner {
         match User::set_fields(&db, oid, doc! { "banner": Bson::Null }).await {
             Ok(Some(_)) => {
+                let mut cleanup_error = None;
                 if public_media_key_owned_by_user(banner, &user_id) {
-                    let _ = storage().delete_public_media_key(banner).await;
+                    if let Err(error) = PendingStorageDeletion::delete_or_defer(
+                        &db,
+                        banner,
+                        StorageObjectKind::PublicMedia,
+                    )
+                    .await
+                    {
+                        log::error!("Failed to schedule cleanup for removed profile banner {banner}: {error}");
+                        cleanup_error = Some(error);
+                    }
                 }
                 emit_profile_event(
                     &db,
@@ -1894,6 +1953,12 @@ pub async fn remove_profile_banner(req: HttpRequest) -> HttpResponse {
                     }),
                 )
                 .await;
+                if cleanup_error.is_some() {
+                    return HttpResponse::ServiceUnavailable().json(json!({
+                        "message": "Profile banner was removed, but storage cleanup is pending.",
+                        "retryable": true,
+                    }));
+                }
             }
             Ok(None) => {
                 return HttpResponse::NotFound().json(json!({ "error": "User not found" }));
@@ -2079,9 +2144,13 @@ pub async fn cancel_account_deletion(
     }
 
     let now = DateTime::now();
-    if User::collection(&db)
+    let cancellation = match User::collection(&db)
         .update_one(
-            doc! { "_id": oid },
+            doc! {
+                "_id": oid,
+                "deletionScheduledAt": { "$exists": true },
+                "deletionInProgress": { "$ne": true },
+            },
             doc! {
                 "$set": {
                     "updatedAt": now,
@@ -2093,10 +2162,18 @@ pub async fn cancel_account_deletion(
             },
         )
         .await
-        .is_err()
     {
-        return HttpResponse::InternalServerError().json(json!({
-            "message": "Nie udało się anulować usunięcia konta."
+        Ok(result) => result,
+        Err(_) => {
+            return HttpResponse::InternalServerError().json(json!({
+                "message": "Nie udało się anulować usunięcia konta."
+            }));
+        }
+    };
+    if cancellation.modified_count == 0 {
+        return HttpResponse::Conflict().json(json!({
+            "message": "Usuwanie konta już się rozpoczęło i nie można go anulować.",
+            "code": "ACCOUNT_DELETION_IN_PROGRESS",
         }));
     }
 

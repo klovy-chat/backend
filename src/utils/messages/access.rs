@@ -221,15 +221,18 @@ pub fn validate_message_file_url(user_id: &str, file_url: &Option<String>) -> bo
     }
 }
 
-pub async fn cleanup_attachment_if_unreferenced(db: &Database, file_url: Option<&str>) {
+pub async fn cleanup_attachment_if_unreferenced(
+    db: &Database,
+    file_url: Option<&str>,
+) -> Result<(), String> {
     let Some(url) = file_url else {
-        return;
+        return Ok(());
     };
     let Some(path) = canonicalize_message_file_url(url, &cdn_public_base_url()) else {
-        return;
+        return Ok(());
     };
     if path.is_empty() || path.starts_with("https://") || !is_attachment_key(&path) {
-        return;
+        return Ok(());
     }
 
     let aliases = attachment_stored_url_aliases(&path, &cdn_public_base_url());
@@ -239,53 +242,57 @@ pub async fn cleanup_attachment_if_unreferenced(db: &Database, file_url: Option<
             "fileUrl": { "$in": aliases },
         })
         .await
-        .unwrap_or(1);
+        .map_err(|e| format!("count attachment references for {path}: {e}"))?;
 
     if count == 0 {
-        let owner = find_attachment_uploader(db, &path).await;
+        let owner = find_attachment_uploader(db, &path).await?;
         let size = storage()
             .head_attachment_content_length(&path)
             .await
-            .ok()
-            .flatten()
+            .map_err(|e| format!("read attachment size for {path}: {e}"))?
             .unwrap_or(0);
         let thumb_bytes = if let Some(thumb) = crate::utils::storage::attachment_thumb_key(&path)
         {
             storage()
                 .head_attachment_content_length(&thumb)
                 .await
-                .ok()
-                .flatten()
+                .map_err(|e| format!("read thumbnail size for {thumb}: {e}"))?
                 .unwrap_or(0)
         } else {
             0
         };
 
-        let _ = storage().delete_attachment_key(&path).await;
+        storage()
+            .delete_attachment_key(&path)
+            .await
+            .map_err(|e| format!("delete attachment {path}: {e}"))?;
 
-        if let Some((user_id, bytes)) = owner {
+        if let Some(user_id) = owner {
             let measured = size.saturating_add(thumb_bytes);
-            let decrement = if bytes > 0 {
-                bytes as i64
-            } else {
-                measured as i64
-            };
-            if decrement > 0 {
-                let _ = crate::model::storage_usage::UserStorageUsage::adjust(
-                    db, user_id, -decrement,
+            if measured > 0 {
+                crate::model::storage_usage::UserStorageUsage::adjust(
+                    db,
+                    user_id,
+                    -(measured as i64),
                 )
-                .await;
+                .await
+                .map_err(|e| format!("update storage usage for {user_id}: {e}"))?;
             }
         }
     }
+    Ok(())
 }
 
-async fn find_attachment_uploader(db: &Database, path: &str) -> Option<(ObjectId, u64)> {
-    if let Ok(Some(pending)) = PendingUpload::collection(db)
+async fn find_attachment_uploader(
+    db: &Database,
+    path: &str,
+) -> Result<Option<ObjectId>, String> {
+    if let Some(pending) = PendingUpload::collection(db)
         .find_one(mongodb::bson::doc! { "filePath": path })
         .await
+        .map_err(|e| format!("find pending upload for {path}: {e}"))?
     {
-        return Some((pending.user_id, pending.file_size));
+        return Ok(Some(pending.user_id));
     }
 
     let aliases = attachment_stored_url_aliases(path, &cdn_public_base_url());
@@ -294,10 +301,9 @@ async fn find_attachment_uploader(db: &Database, path: &str) -> Option<(ObjectId
             "fileUrl": { "$in": aliases },
         })
         .await
-        .ok()
-        .flatten()?;
+        .map_err(|e| format!("find message uploader for {path}: {e}"))?;
 
-    Some((message.sender, message.file_size.unwrap_or(0)))
+    Ok(message.map(|message| message.sender))
 }
 
 async fn attachment_stored_size_is_valid(

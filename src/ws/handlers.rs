@@ -2314,7 +2314,9 @@ async fn handle_delete_message(connected: &str, payload: DeleteMessagePayload) {
     let crate::model::messages::SoftDeleteOutcome::Deleted { was_unread } = outcome else {
         return;
     };
-    cleanup_attachment_if_unreferenced(&db, msg.file_url.as_deref()).await;
+    if let Err(e) = cleanup_attachment_if_unreferenced(&db, msg.file_url.as_deref()).await {
+        log::error!("Failed to clean up deleted message attachment {message_id}: {e}");
+    }
     let body = json!({ "_id": message_id });
     if let Some(channel_id) = msg.channel {
         let channel_id_hex = channel_id.to_hex();

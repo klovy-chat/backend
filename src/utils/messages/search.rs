@@ -8,7 +8,7 @@
 // Przy zmianach: hmac.rs, controllers/messages.rs, channels.rs.
 
 use futures_util::TryStreamExt;
-use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
+use mongodb::bson::{doc, oid::ObjectId, Bson, DateTime, Document};
 use mongodb::Database;
 use std::sync::OnceLock;
 
@@ -241,13 +241,28 @@ async fn collect_message_file_urls(
 
     let mut urls = Vec::new();
     while let Some(doc) = cursor.try_next().await? {
-        if let Ok(url) = doc.get_str("fileUrl") {
-            if !url.is_empty() {
-                urls.push(url.to_string());
+        match doc.get("fileUrl") {
+            None | Some(Bson::Null) => continue,
+            Some(Bson::String(url)) if !url.is_empty() => urls.push(url.clone()),
+            Some(Bson::String(_)) => {}
+            Some(value) => {
+                return Err(mongodb::error::Error::custom(format!(
+                    "Invalid fileUrl on message {}: expected a string, got {value:?}",
+                    doc.get_object_id("_id")
+                        .map(|id| id.to_hex())
+                        .unwrap_or_else(|_| "unknown".to_string())
+                )));
             }
         }
     }
     Ok(urls)
+}
+
+pub async fn message_file_urls(
+    db: &Database,
+    filter: Document,
+) -> mongodb::error::Result<Vec<String>> {
+    collect_message_file_urls(db, filter).await
 }
 
 fn soft_delete_set() -> Document {

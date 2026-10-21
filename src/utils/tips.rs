@@ -6,7 +6,7 @@
 // Pusty tip po delete nie może przegrać z żywym cache FE (preview.ts).
 // Przy zmianach: contacts.rs, channels, preview.ts.
 
-use mongodb::bson::{doc, oid::ObjectId, Bson, DateTime};
+use mongodb::bson::{doc, oid::ObjectId, Bson, DateTime, Document};
 use mongodb::options::{IndexOptions, UpdateOptions};
 use mongodb::{Collection, Database, IndexModel};
 use serde::{Deserialize, Serialize};
@@ -79,21 +79,28 @@ fn tip_preview(msg: &Message) -> String {
     content_for_api(&msg.content)
 }
 
+async fn message_is_active(db: &Database, id: ObjectId) -> mongodb::error::Result<bool> {
+    Ok(db
+        .collection::<Document>("messages")
+        .find_one(doc! { "_id": id, "deleted": { "$ne": true } })
+        .projection(doc! { "_id": 1 })
+        .await?
+        .is_some())
+}
+
 pub async fn upsert_dm_tip(db: &Database, msg: &Message) {
     let (Some(recipient), None) = (msg.recipient, msg.channel) else {
         return;
     };
     let Some(mid) = msg.id else { return };
 
-    let still_active = match Message::collection(db)
-        .find_one(doc! { "_id": mid, "deleted": { "$ne": true } })
-        .projection(doc! { "_id": 1 })
-        .await
-    {
-        Ok(Some(_)) => true,
-        Ok(None) => false,
+    let still_active = match message_is_active(db, mid).await {
+        Ok(still_active) => still_active,
         Err(e) => {
-            log::warn!("upsert_dm_tip still_active probe failed mid={}: {e}", mid.to_hex());
+            log::warn!(
+                "upsert_dm_tip still_active probe failed mid={}: {e}",
+                mid.to_hex()
+            );
             return;
         }
     };
@@ -144,13 +151,8 @@ pub async fn upsert_dm_tip(db: &Database, msg: &Message) {
 
 pub async fn upsert_channel_tip(db: &Database, channel_id: ObjectId, msg: &Message) {
     let Some(mid) = msg.id else { return };
-    let still_active = match Message::collection(db)
-        .find_one(doc! { "_id": mid, "deleted": { "$ne": true } })
-        .projection(doc! { "_id": 1 })
-        .await
-    {
-        Ok(Some(_)) => true,
-        Ok(None) => false,
+    let still_active = match message_is_active(db, mid).await {
+        Ok(still_active) => still_active,
         Err(e) => {
             log::warn!(
                 "upsert_channel_tip still_active probe failed mid={}: {e}",
@@ -461,6 +463,85 @@ pub async fn recompute_channel_tip(db: &Database, channel_id: ObjectId) {
                 .await;
         }
     }
+}
+
+pub async fn recompute_channel_tip_checked(
+    db: &Database,
+    channel_id: ObjectId,
+) -> mongodb::error::Result<()> {
+    use futures_util::TryStreamExt;
+
+    let Some(channel) = Channel::find_by_id(db, channel_id).await? else {
+        return Ok(());
+    };
+    let latest = Message::collection(db)
+        .find(doc! { "channel": channel_id, "deleted": { "$ne": true } })
+        .sort(doc! { "timestamp": -1, "_id": -1 })
+        .limit(1)
+        .await?
+        .try_next()
+        .await?;
+
+    match latest {
+        Some(msg) => {
+            let Some(message_id) = msg.id else {
+                return Err(mongodb::error::Error::custom(
+                    "Latest channel message has no identifier",
+                ));
+            };
+            Channel::collection(db)
+                .update_one(
+                    doc! {
+                        "_id": channel_id,
+                        "$or": [
+                            { "lastMessageAt": { "$exists": false } },
+                            { "lastMessageAt": { "$eq": Bson::Null } },
+                            { "lastMessageAt": { "$lt": msg.timestamp } },
+                            {
+                                "lastMessageAt": msg.timestamp,
+                                "lastMessageId": { "$lt": message_id },
+                            },
+                            { "lastMessageId": message_id },
+                        ],
+                    },
+                    doc! {
+                        "$set": {
+                            "lastMessage": tip_preview(&msg),
+                            "lastMessageAt": msg.timestamp,
+                            "lastMessageId": message_id,
+                            "updatedAt": DateTime::now(),
+                        }
+                    },
+                )
+                .await?;
+        }
+        None => {
+            let filter = match channel.last_message_id {
+                Some(id) => doc! { "_id": channel_id, "lastMessageId": id },
+                None => doc! {
+                    "_id": channel_id,
+                    "$or": [
+                        { "lastMessageId": { "$exists": false } },
+                        { "lastMessageId": Bson::Null },
+                    ],
+                },
+            };
+            Channel::collection(db)
+                .update_one(
+                    filter,
+                    doc! {
+                        "$unset": {
+                            "lastMessage": "",
+                            "lastMessageAt": "",
+                            "lastMessageId": "",
+                        },
+                        "$set": { "updatedAt": DateTime::now() },
+                    },
+                )
+                .await?;
+        }
+    }
+    Ok(())
 }
 
 pub async fn load_dm_tips_for_friends(

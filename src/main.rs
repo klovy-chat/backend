@@ -14,7 +14,7 @@ use klovy_chat_server::model::{
     friend_requests::FriendRequest, invites::Invite,
     messages::Message, uploads::PendingUpload, scan_cache::ScanVerdict,
     refresh_tokens::RefreshToken, users::User, storage_usage::UserStorageUsage,
-    warnings::Warning,
+    storage_cleanup::PendingStorageDeletion, warnings::Warning,
 };
 use klovy_chat_server::utils::db_url::database_url;
 use klovy_chat_server::utils::db;
@@ -67,6 +67,13 @@ async fn main() -> std::io::Result<()> {
         Err(e) => log::warn!("Pending upload cleanup failed: {e}"),
         _ => {}
     }
+    match PendingStorageDeletion::process_pending(&mongodb_db).await {
+        Ok(deleted) if deleted > 0 => {
+            log::info!("Startup: completed {deleted} pending storage deletions");
+        }
+        Err(error) => log::warn!("Startup pending storage deletion processing failed: {error}"),
+        _ => {}
+    }
 
     match klovy_chat_server::utils::admin::repair_broken_account_status_fields(&mongodb_db).await {
         Ok(repaired) if repaired > 0 => {
@@ -111,6 +118,21 @@ async fn main() -> std::io::Result<()> {
                     log::info!("Periodic cleanup removed {removed} orphaned pending uploads");
                 }
                 Err(e) => log::warn!("Periodic pending upload cleanup failed: {e}"),
+                _ => {}
+            }
+        }
+    });
+
+    tokio::spawn(async {
+        let interval = std::time::Duration::from_secs(60 * 60);
+        loop {
+            tokio::time::sleep(interval).await;
+            let db = klovy_chat_server::utils::db::get_db();
+            match PendingStorageDeletion::process_pending(&db).await {
+                Ok(deleted) if deleted > 0 => {
+                    log::info!("Periodic cleanup completed {deleted} pending storage deletions");
+                }
+                Err(error) => log::warn!("Pending storage deletion processing failed: {error}"),
                 _ => {}
             }
         }
@@ -180,7 +202,7 @@ async fn main() -> std::io::Result<()> {
 }
 
 async fn ensure_indexes(db: &mongodb::Database) {
-    let tasks: [(&str, mongodb::error::Result<()>); 16] = [
+    let tasks: [(&str, mongodb::error::Result<()>); 17] = [
         ("users", User::create_indexes(db).await),
         ("signup_quotas", klovy_chat_server::utils::registration::create_indexes(db).await),
         ("channels", Channel::create_indexes(db).await),
@@ -194,6 +216,7 @@ async fn ensure_indexes(db: &mongodb::Database) {
         ("pending_uploads", PendingUpload::create_indexes(db).await),
         ("attachment_scan_cache", ScanVerdict::create_indexes(db).await),
         ("user_storage_usage", UserStorageUsage::create_indexes(db).await),
+        ("pending_storage_deletions", PendingStorageDeletion::create_indexes(db).await),
         ("audit_logs", AuditLog::create_indexes(db).await),
         ("warnings", Warning::create_indexes(db).await),
         ("announcements", Announcement::create_indexes(db).await),

@@ -25,6 +25,7 @@ use crate::utils::storage::{avatar_key_owned_by_channel, storage};
 use crate::ws::registry::disconnect_user;
 
 pub const DELETION_GRACE_DAYS: i64 = 7;
+const DELETION_CLAIM_TIMEOUT_MS: i64 = 24 * 60 * 60 * 1000;
 
 pub async fn repair_broken_account_status_fields(db: &Database) -> Result<u64, mongodb::error::Error> {
     let result = User::collection(db)
@@ -122,34 +123,84 @@ pub async fn purge_removed_schema_fields(
     Ok(report)
 }
 
-async fn delete_message_attachment(storage: &crate::utils::storage::R2Storage, path: &str) {
-    let _ = storage.delete_attachment_key(path).await;
+async fn delete_message_attachment(
+    storage: &crate::utils::storage::R2Storage,
+    path: &str,
+) -> Result<(), mongodb::error::Error> {
+    storage
+        .delete_attachment_key(path)
+        .await
+        .map_err(|e| mongodb::error::Error::custom(e.to_string()))?;
     if path.starts_with('/') {
-        let _ = storage.delete_attachment_key(&path[1..]).await;
+        storage
+            .delete_attachment_key(&path[1..])
+            .await
+            .map_err(|e| mongodb::error::Error::custom(e.to_string()))?;
     }
+    Ok(())
 }
 
-async fn delete_user_storage_files(user: &User, user_id: ObjectId, db: &Database) {
+async fn delete_user_storage_files(
+    user: &User,
+    user_id: ObjectId,
+    db: &Database,
+) -> Result<(), mongodb::error::Error> {
     let storage = storage();
 
-    if let Some(image) = user.image.as_deref() {
-        let _ = storage.delete_avatar_key(image).await;
-    }
-    if let Some(banner) = user.banner.as_deref() {
-        let _ = storage.delete_public_media_key(banner).await;
-    }
-
-    let owned_channels: Vec<Channel> = match Channel::collection(db)
+    let owned_channels: Vec<Channel> = Channel::collection(db)
         .find(doc! { "admin": user_id })
-        .await
-    {
-        Ok(cursor) => cursor.try_collect().await.unwrap_or_default(),
-        Err(_) => Vec::new(),
-    };
+        .await?
+        .try_collect()
+        .await?;
     let owned_channel_ids: Vec<ObjectId> = owned_channels
         .iter()
         .filter_map(|channel| channel.id)
         .collect();
+
+    let pending_cursor = PendingUpload::collection(db)
+        .find(doc! { "userId": user_id })
+        .await?;
+    let pending_uploads: Vec<PendingUpload> = pending_cursor.try_collect().await?;
+
+    let mut attachment_filter = vec![doc! { "sender": user_id }, doc! { "recipient": user_id }];
+    if !owned_channel_ids.is_empty() {
+        attachment_filter.push(doc! { "channel": { "$in": &owned_channel_ids } });
+    }
+    let message_cursor = db
+        .collection::<mongodb::bson::Document>("messages")
+        .find(doc! {
+            "$or": attachment_filter,
+            "fileUrl": { "$exists": true, "$ne": null },
+        })
+        .await?;
+    let messages: Vec<mongodb::bson::Document> = message_cursor.try_collect().await?;
+    let attachment_paths: Vec<&str> = messages
+        .iter()
+        .map(|message| {
+            message.get_str("fileUrl").map_err(|error| {
+                mongodb::error::Error::custom(format!(
+                    "Invalid fileUrl on message {}: {error}",
+                    message
+                        .get_object_id("_id")
+                        .map(|id| id.to_hex())
+                        .unwrap_or_else(|_| "unknown".to_string())
+                ))
+            })
+        })
+        .collect::<Result<_, _>>()?;
+
+    if let Some(image) = user.image.as_deref() {
+        storage
+            .delete_avatar_key(image)
+            .await
+            .map_err(|e| mongodb::error::Error::custom(e.to_string()))?;
+    }
+    if let Some(banner) = user.banner.as_deref() {
+        storage
+            .delete_public_media_key(banner)
+            .await
+            .map_err(|e| mongodb::error::Error::custom(e.to_string()))?;
+    }
 
     for channel in &owned_channels {
         if channel.image.is_empty() {
@@ -157,64 +208,46 @@ async fn delete_user_storage_files(user: &User, user_id: ObjectId, db: &Database
         }
         let channel_id = channel.id.map(|id| id.to_hex()).unwrap_or_default();
         if avatar_key_owned_by_channel(&channel.image, &channel_id) {
-            let _ = storage.delete_avatar_key(&channel.image).await;
+            storage
+                .delete_avatar_key(&channel.image)
+                .await
+                .map_err(|e| mongodb::error::Error::custom(e.to_string()))?;
         }
     }
 
-    if let Ok(cursor) = PendingUpload::collection(db)
-        .find(doc! { "userId": user_id })
-        .await
-    {
-        if let Ok(entries) = cursor.try_collect::<Vec<PendingUpload>>().await {
-            for entry in entries {
-                let _ = storage.delete_attachment_key(&entry.file_path).await;
-            }
-        }
+    for entry in pending_uploads {
+        storage
+            .delete_attachment_key(&entry.file_path)
+            .await
+            .map_err(|e| mongodb::error::Error::custom(e.to_string()))?;
     }
 
-    let mut attachment_filter = vec![
-        doc! { "sender": user_id },
-        doc! { "recipient": user_id },
-    ];
-    if !owned_channel_ids.is_empty() {
-        attachment_filter.push(doc! { "channel": { "$in": &owned_channel_ids } });
+    for path in attachment_paths {
+        delete_message_attachment(&storage, path).await?;
     }
-
-    if let Ok(cursor) = Message::collection(db)
-        .find(doc! {
-            "$or": attachment_filter,
-            "fileUrl": { "$exists": true, "$ne": null },
-        })
-        .await
-    {
-        if let Ok(messages) = cursor.try_collect::<Vec<Message>>().await {
-            for message in messages {
-                if let Some(path) = message.file_url.as_deref() {
-                    delete_message_attachment(&storage, path).await;
-                }
-            }
-        }
-    }
+    Ok(())
 }
 
-async fn purge_user_related_records(db: &Database, user_id: ObjectId) {
-    let _ = RefreshToken::revoke_all_for_user(db, user_id).await;
-    let _ = Warning::collection(db)
+async fn purge_user_related_records(
+    db: &Database,
+    user_id: ObjectId,
+) -> Result<(), mongodb::error::Error> {
+    Warning::collection(db)
         .delete_many(doc! { "userId": user_id })
-        .await;
-    let _ = PendingUpload::collection(db)
+        .await?;
+    PendingUpload::collection(db)
         .delete_many(doc! { "userId": user_id })
-        .await;
-    let _ = db
-        .collection::<mongodb::bson::Document>("user_storage_usage")
+        .await?;
+    db.collection::<mongodb::bson::Document>("user_storage_usage")
         .delete_many(doc! { "userId": user_id })
-        .await;
-    let _ = ChannelReadState::collection(db)
+        .await?;
+    ChannelReadState::collection(db)
         .delete_many(doc! { "userId": user_id })
-        .await;
-    let _ = ChannelReport::collection(db)
+        .await?;
+    ChannelReport::collection(db)
         .delete_many(doc! { "reportedBy": user_id })
-        .await;
+        .await?;
+    Ok(())
 }
 
 pub async fn purge_user_data(
@@ -233,8 +266,7 @@ pub async fn purge_user_data(
         })
         .await?
         .try_collect()
-        .await
-        .unwrap_or_default();
+        .await?;
     for f in &friendships {
         let peer = if f.from == user_id { f.to } else { f.from };
         let peer_hex = peer.to_hex();
@@ -279,19 +311,18 @@ pub async fn purge_user_data(
             }
         }
     }
-    let _ = DmConversationTip::collection(db)
+    DmConversationTip::collection(db)
         .delete_many(doc! {
             "$or": [{ "userA": user_id }, { "userB": user_id }],
         })
-        .await;
+        .await?;
 
     let tip_channel_oids: Vec<ObjectId> = Message::collection(db)
         .distinct("channel", doc! {
             "sender": user_id,
             "channel": { "$type": "objectId" },
         })
-        .await
-        .unwrap_or_default()
+        .await?
         .into_iter()
         .filter_map(|b| match b {
             mongodb::bson::Bson::ObjectId(oid) => Some(oid),
@@ -322,8 +353,7 @@ pub async fn purge_user_data(
         .await?;
 
     let member_channels: Vec<Channel> = Channel::find_by_member(db, user_id)
-        .await
-        .unwrap_or_default();
+        .await?;
 
     Channel::collection(db)
         .update_many(
@@ -363,8 +393,7 @@ pub async fn purge_user_data(
         .find(doc! { "admin": user_id })
         .await?
         .try_collect()
-        .await
-        .unwrap_or_default();
+        .await?;
 
     let owned_ids: Vec<ObjectId> = owned.iter().filter_map(|c| c.id).collect();
     let owned_set: std::collections::HashSet<ObjectId> = owned_ids.iter().copied().collect();
@@ -373,7 +402,7 @@ pub async fn purge_user_data(
         if owned_set.contains(&cid) {
             continue;
         }
-        crate::utils::tips::recompute_channel_tip(db, cid).await;
+        crate::utils::tips::recompute_channel_tip_checked(db, cid).await?;
     }
 
     let channels_deleted = owned_ids.len() as u64;
@@ -404,9 +433,9 @@ pub async fn purge_user_data(
         Invite::collection(db)
             .delete_many(doc! { "channelId": { "$in": &owned_ids } })
             .await?;
-        let _ = ChannelReadState::collection(db)
+        ChannelReadState::collection(db)
             .delete_many(doc! { "channelId": { "$in": &owned_ids } })
-            .await;
+            .await?;
         Channel::collection(db)
             .delete_many(doc! { "_id": { "$in": &owned_ids } })
             .await?;
@@ -427,14 +456,16 @@ pub async fn purge_user_completely(
         mongodb::error::Error::custom("User not found for purge")
     })?;
 
-    delete_user_storage_files(&user, user_id, db).await;
-    purge_user_related_records(db, user_id).await;
+    RefreshToken::revoke_all_for_user(db, user_id).await?;
     disconnect_user(&user_id.to_hex());
+    delete_user_storage_files(&user, user_id, db).await?;
+    purge_user_related_records(db, user_id).await?;
     purge_user_data(db, user_id).await
 }
 
 pub async fn process_scheduled_deletions(db: &Database) -> Result<u64, mongodb::error::Error> {
     let now = DateTime::now();
+    let stale_claim_before = DateTime::from_millis(now.timestamp_millis() - DELETION_CLAIM_TIMEOUT_MS);
     let users: Vec<User> = User::collection(db)
         .find(doc! {
             "deletionScheduledAt": { "$lte": now },
@@ -446,6 +477,34 @@ pub async fn process_scheduled_deletions(db: &Database) -> Result<u64, mongodb::
     let mut deleted = 0u64;
     for user in users {
         let Some(user_id) = user.id else { continue };
+        let claim_id = ObjectId::new().to_hex();
+        let claim_time = DateTime::now();
+        let claim = User::collection(db)
+            .update_one(
+                doc! {
+                    "_id": user_id,
+                    "deletionScheduledAt": { "$lte": now },
+                    "$or": [
+                        { "deletionInProgress": { "$ne": true } },
+                        {
+                            "deletionInProgress": true,
+                            "deletionClaimedAt": { "$lte": stale_claim_before },
+                        },
+                    ],
+                },
+                doc! {
+                    "$set": {
+                        "deletionInProgress": true,
+                        "deletionClaimId": &claim_id,
+                        "deletionClaimedAt": claim_time,
+                    }
+                },
+            )
+            .await?;
+        if claim.modified_count == 0 {
+            continue;
+        }
+
         match purge_user_completely(db, user_id).await {
             Ok(_) => {
                 deleted += 1;
@@ -456,6 +515,28 @@ pub async fn process_scheduled_deletions(db: &Database) -> Result<u64, mongodb::
                     "Failed to auto-delete user {}: {e}",
                     user_id.to_hex()
                 );
+                if let Err(reset_error) = User::collection(db)
+                    .update_one(
+                        doc! {
+                            "_id": user_id,
+                            "deletionInProgress": true,
+                            "deletionClaimId": &claim_id,
+                        },
+                        doc! {
+                            "$unset": {
+                                "deletionInProgress": "",
+                                "deletionClaimId": "",
+                                "deletionClaimedAt": "",
+                            }
+                        },
+                    )
+                    .await
+                {
+                    log::error!(
+                        "Failed to release account deletion claim for {}: {reset_error}",
+                        user_id.to_hex()
+                    );
+                }
             }
         }
     }
