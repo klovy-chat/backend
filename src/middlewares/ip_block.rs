@@ -40,8 +40,8 @@ impl IPBlockerArc {
         Self {
             blocked_ips: Arc::new(Mutex::new(HashSet::new())),
             suspicious_activity: Mutex::new(HashMap::new()),
-            max_suspicious_activity: 10,
-            block_duration: Duration::from_secs(60 * 60),
+            max_suspicious_activity: 30,
+            block_duration: Duration::from_secs(30 * 60),
         }
     }
 
