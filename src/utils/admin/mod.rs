@@ -12,13 +12,13 @@ use mongodb::Database;
 use serde_json::json;
 
 use crate::model::channels::Channel;
-use crate::model::read_state::ChannelReadState;
-use crate::model::reports::ChannelReport;
 use crate::model::friend_requests::FriendRequest;
 use crate::model::invites::Invite;
 use crate::model::messages::Message;
-use crate::model::uploads::PendingUpload;
+use crate::model::read_state::ChannelReadState;
 use crate::model::refresh_tokens::RefreshToken;
+use crate::model::reports::ChannelReport;
+use crate::model::uploads::PendingUpload;
 use crate::model::users::User;
 use crate::model::warnings::Warning;
 use crate::utils::storage::{avatar_key_owned_by_channel, storage};
@@ -27,7 +27,9 @@ use crate::ws::registry::disconnect_user;
 pub const DELETION_GRACE_DAYS: i64 = 7;
 const DELETION_CLAIM_TIMEOUT_MS: i64 = 24 * 60 * 60 * 1000;
 
-pub async fn repair_broken_account_status_fields(db: &Database) -> Result<u64, mongodb::error::Error> {
+pub async fn repair_broken_account_status_fields(
+    db: &Database,
+) -> Result<u64, mongodb::error::Error> {
     let result = User::collection(db)
         .update_many(
             doc! { "isDisabled": mongodb::bson::Bson::Null },
@@ -111,7 +113,6 @@ pub async fn purge_removed_schema_fields(
                 }
             }
             Err(e) => {
-
                 let msg = e.to_string();
                 if !msg.contains("NamespaceNotFound") && !msg.contains("ns not found") {
                     return Err(e);
@@ -298,8 +299,7 @@ pub async fn purge_user_data(
     }
 
     for channel_id in crate::utils::voice::channels::clear_user_from_all_channels(&user_hex) {
-        let participants =
-            crate::utils::voice::channels::participants_in_channel(&channel_id);
+        let participants = crate::utils::voice::channels::participants_in_channel(&channel_id);
         if let Ok(oid) = ObjectId::parse_str(&channel_id) {
             if let Ok(Some(ch)) = Channel::find_by_id(db, oid).await {
                 let recipients = channel_recipient_ids(&ch);
@@ -318,10 +318,13 @@ pub async fn purge_user_data(
         .await?;
 
     let tip_channel_oids: Vec<ObjectId> = Message::collection(db)
-        .distinct("channel", doc! {
-            "sender": user_id,
-            "channel": { "$type": "objectId" },
-        })
+        .distinct(
+            "channel",
+            doc! {
+                "sender": user_id,
+                "channel": { "$type": "objectId" },
+            },
+        )
         .await?
         .into_iter()
         .filter_map(|b| match b {
@@ -352,8 +355,7 @@ pub async fn purge_user_data(
         .delete_many(doc! { "createdBy": user_id })
         .await?;
 
-    let member_channels: Vec<Channel> = Channel::find_by_member(db, user_id)
-        .await?;
+    let member_channels: Vec<Channel> = Channel::find_by_member(db, user_id).await?;
 
     Channel::collection(db)
         .update_many(
@@ -452,9 +454,9 @@ pub async fn purge_user_completely(
     db: &Database,
     user_id: ObjectId,
 ) -> Result<u64, mongodb::error::Error> {
-    let user = User::find_by_id(db, user_id).await?.ok_or_else(|| {
-        mongodb::error::Error::custom("User not found for purge")
-    })?;
+    let user = User::find_by_id(db, user_id)
+        .await?
+        .ok_or_else(|| mongodb::error::Error::custom("User not found for purge"))?;
 
     RefreshToken::revoke_all_for_user(db, user_id).await?;
     disconnect_user(&user_id.to_hex());
@@ -465,7 +467,8 @@ pub async fn purge_user_completely(
 
 pub async fn process_scheduled_deletions(db: &Database) -> Result<u64, mongodb::error::Error> {
     let now = DateTime::now();
-    let stale_claim_before = DateTime::from_millis(now.timestamp_millis() - DELETION_CLAIM_TIMEOUT_MS);
+    let stale_claim_before =
+        DateTime::from_millis(now.timestamp_millis() - DELETION_CLAIM_TIMEOUT_MS);
     let users: Vec<User> = User::collection(db)
         .find(doc! {
             "deletionScheduledAt": { "$lte": now },
@@ -511,10 +514,7 @@ pub async fn process_scheduled_deletions(db: &Database) -> Result<u64, mongodb::
                 log::info!("Auto-deleted user account {}", user_id.to_hex());
             }
             Err(e) => {
-                log::error!(
-                    "Failed to auto-delete user {}: {e}",
-                    user_id.to_hex()
-                );
+                log::error!("Failed to auto-delete user {}: {e}", user_id.to_hex());
                 if let Err(reset_error) = User::collection(db)
                     .update_one(
                         doc! {

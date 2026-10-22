@@ -10,9 +10,7 @@ use mongodb::bson::{doc, oid::ObjectId, DateTime};
 use mongodb::Database;
 use serde_json::{json, Value};
 
-use crate::model::channel_moderation::{
-    active_moderation_entries, ChannelModerationEntry,
-};
+use crate::model::channel_moderation::{active_moderation_entries, ChannelModerationEntry};
 use crate::model::channels::Channel;
 
 pub async fn pull_muted_member(
@@ -214,9 +212,8 @@ pub async fn maybe_prune_channel_moderation(db: &Database, channel: &Channel) ->
         .collect();
 
     if let Some(channel_id) = channel.id {
-
         let now = DateTime::now();
-        let _ = Channel::collection(db)
+        if let Err(error) = Channel::collection(db)
             .update_one(
                 doc! { "_id": channel_id },
                 doc! {
@@ -227,7 +224,13 @@ pub async fn maybe_prune_channel_moderation(db: &Database, channel: &Channel) ->
                     "$set": { "updatedAt": now },
                 },
             )
-            .await;
+            .await
+        {
+            log::error!(
+                "Failed to prune expired channel moderation entries for channel {}: {error}",
+                channel_id.to_hex()
+            );
+        }
         let channel_id_hex = channel_id.to_hex();
         crate::ws::typing::invalidate_channel(&channel_id_hex);
         crate::utils::access::cache::invalidate_channel(&channel_id_hex);

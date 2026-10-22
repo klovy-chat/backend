@@ -15,9 +15,7 @@ use std::sync::OnceLock;
 use crate::model::messages::Message;
 use crate::utils::crypto::encrypt::{decrypt_field, encrypt_field};
 use crate::utils::crypto::hmac::{derive_subkey, hmac_sha256_hex};
-use crate::utils::messages::storage::{
-    inbound_plaintext_for_processing, reveal_content_internal,
-};
+use crate::utils::messages::storage::{inbound_plaintext_for_processing, reveal_content_internal};
 
 const SEARCH_NGRAM_LEN: usize = 2;
 const SEARCH_TOKEN_CONTEXT: &str = "search-token-v1";
@@ -234,10 +232,7 @@ async fn collect_message_file_urls(
     filter: Document,
 ) -> mongodb::error::Result<Vec<String>> {
     let coll = db.collection::<Document>("messages");
-    let mut cursor = coll
-        .find(filter)
-        .projection(doc! { "fileUrl": 1 })
-        .await?;
+    let mut cursor = coll.find(filter).projection(doc! { "fileUrl": 1 }).await?;
 
     let mut urls = Vec::new();
     while let Some(doc) = cursor.try_next().await? {
@@ -285,15 +280,58 @@ fn soft_delete_set() -> Document {
 pub async fn wipe_live_messages(
     db: &Database,
     filter: Document,
-) -> mongodb::error::Result<Vec<String>> {
+) -> mongodb::error::Result<WipeLiveMessagesResult> {
     let coll = db.collection::<Document>("messages");
     let mut urls = collect_message_file_urls(db, filter.clone()).await?;
-    coll.update_many(filter.clone(), soft_delete_set()).await?;
-
-    let late = collect_message_file_urls(db, filter.clone()).await?;
-    if !late.is_empty() {
-        urls.extend(late);
-        coll.update_many(filter, soft_delete_set()).await?;
+    if let Err(error) = coll.update_many(filter.clone(), soft_delete_set()).await {
+        log::error!("Initial message wipe returned an error; retrying idempotently: {error}");
+        if let Err(retry_error) = coll.update_many(filter.clone(), soft_delete_set()).await {
+            log::error!("Message wipe retry failed; completion is uncertain: {retry_error}");
+            return Ok(WipeLiveMessagesResult {
+                file_urls: urls,
+                wipe_pending: true,
+            });
+        }
     }
-    Ok(urls)
+
+    for _ in 0..3 {
+        let late = match collect_message_file_urls(db, filter.clone()).await {
+            Ok(urls) => urls,
+            Err(error) => {
+                log::error!(
+                    "Messages were wiped, but late attachment URLs could not be collected: {error}"
+                );
+                return Ok(WipeLiveMessagesResult {
+                    file_urls: urls,
+                    wipe_pending: true,
+                });
+            }
+        };
+        if late.is_empty() {
+            return Ok(WipeLiveMessagesResult {
+                file_urls: urls,
+                wipe_pending: false,
+            });
+        }
+        urls.extend(late);
+        if let Err(error) = coll.update_many(filter.clone(), soft_delete_set()).await {
+            log::error!("Late message wipe failed; retrying idempotently: {error}");
+            if let Err(retry_error) = coll.update_many(filter.clone(), soft_delete_set()).await {
+                log::error!("Late message wipe retry failed: {retry_error}");
+                return Ok(WipeLiveMessagesResult {
+                    file_urls: urls,
+                    wipe_pending: true,
+                });
+            }
+        }
+    }
+    Ok(WipeLiveMessagesResult {
+        file_urls: urls,
+        wipe_pending: true,
+    })
+}
+
+pub struct WipeLiveMessagesResult {
+    pub file_urls: Vec<String>,
+    pub wipe_pending: bool,
 }

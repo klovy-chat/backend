@@ -21,8 +21,14 @@ const CACHE_MAX: usize = 8_000;
 
 #[derive(Clone)]
 enum Cached {
-    Allow { at_ms: i64, channel: Channel },
-    Deny { at_ms: i64, reason: AccessDeniedReason },
+    Allow {
+        at_ms: i64,
+        channel: Channel,
+    },
+    Deny {
+        at_ms: i64,
+        reason: AccessDeniedReason,
+    },
 }
 
 static CACHE: Lazy<Mutex<HashMap<String, Cached>>> = Lazy::new(|| Mutex::new(HashMap::new()));
@@ -38,10 +44,7 @@ fn key(channel_id: &str, user_id: &str) -> String {
     format!("{channel_id}:{user_id}")
 }
 
-pub fn get(
-    channel_id: &str,
-    user_id: &str,
-) -> Option<Result<Channel, AccessDeniedReason>> {
+pub fn get(channel_id: &str, user_id: &str) -> Option<Result<Channel, AccessDeniedReason>> {
     let guard = CACHE.lock().ok()?;
     let entry = guard.get(&key(channel_id, user_id))?;
     match entry {

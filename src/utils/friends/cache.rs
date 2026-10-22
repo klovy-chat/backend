@@ -23,7 +23,6 @@ struct CacheEntry {
 }
 
 struct BlockEntry {
-
     low_blocks_high: bool,
     high_blocks_low: bool,
     cached_at_ms: i64,
@@ -127,12 +126,7 @@ pub fn get_cached_block_flags(viewer: &str, peer: &str) -> Option<(bool, bool)> 
     }
 }
 
-pub fn put_cached_block_flags(
-    viewer: &str,
-    peer: &str,
-    viewer_blocks: bool,
-    peer_blocks: bool,
-) {
+pub fn put_cached_block_flags(viewer: &str, peer: &str, viewer_blocks: bool, peer_blocks: bool) {
     let key = block_pair_key(viewer, peer);
     let (low_blocks_high, high_blocks_low) = if viewer <= peer {
         (viewer_blocks, peer_blocks)

@@ -18,8 +18,8 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
-use crate::middlewares::ip_block::IPBlockerArc;
 use crate::middlewares::captcha::TurnstileOutcome;
+use crate::middlewares::ip_block::IPBlockerArc;
 use crate::utils::env::is_development;
 use crate::utils::ip::client_ip_from_service_request;
 use crate::utils::ratelimit::Store;
@@ -149,7 +149,8 @@ async fn run_auth_fallback_guard(
             if let Some(blocker) = &blocker {
                 blocker.add_suspicious_activity(&ip);
             }
-            let res = HttpResponse::BadRequest().json(serde_json::json!({ "error": "Invalid request" }));
+            let res =
+                HttpResponse::BadRequest().json(serde_json::json!({ "error": "Invalid request" }));
             return Ok(ServiceResponse::new(http_req, res));
         }
     }
@@ -164,7 +165,8 @@ async fn run_auth_fallback_guard(
         if let Some(blocker) = &blocker {
             blocker.add_suspicious_activity(&ip);
         }
-        let res = HttpResponse::BadRequest().json(serde_json::json!({ "error": "Unsupported client" }));
+        let res =
+            HttpResponse::BadRequest().json(serde_json::json!({ "error": "Unsupported client" }));
         return Ok(ServiceResponse::new(http_req, res));
     }
 

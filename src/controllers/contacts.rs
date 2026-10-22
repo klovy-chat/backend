@@ -18,14 +18,11 @@ use crate::model::friend_requests::FriendRequest;
 use crate::model::messages::Message;
 use crate::model::users::User;
 use crate::utils::db::get_db;
-use crate::utils::friends::{try_are_friends, invalidate_friend_ids_pair};
-use crate::ws::typing;
-use crate::utils::messages::{
-    access::cleanup_attachment_if_unreferenced,
-    dm_only_or_clause,
-};
+use crate::utils::friends::{invalidate_friend_ids_pair, try_are_friends};
 use crate::utils::messages::escape_regex;
+use crate::utils::messages::{access::cleanup_attachment_if_unreferenced, dm_only_or_clause};
 use crate::utils::user::json::resolve_display_name;
+use crate::ws::typing;
 
 const MIN_SEARCH_LENGTH: usize = 3;
 const MAX_SEARCH_LENGTH: usize = 64;
@@ -62,7 +59,11 @@ fn normalize_text(s: &str) -> String {
             other => other,
         })
         .collect();
-    mapped.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ")
+    mapped
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 async fn search_users_by_term(
@@ -151,7 +152,8 @@ pub async fn get_contact_profile(req: HttpRequest) -> HttpResponse {
     let friend = match User::find_by_id(&db, contact_oid).await {
         Ok(Some(u)) => u,
         Ok(None) => {
-            return HttpResponse::NotFound().json(json!({ "message": "Użytkownik nie znaleziony" }));
+            return HttpResponse::NotFound()
+                .json(json!({ "message": "Użytkownik nie znaleziony" }));
         }
         Err(e) => {
             log::error!("get_contact_profile: user lookup: {e}");
@@ -195,16 +197,16 @@ pub async fn search_contacts(req: HttpRequest, body: web::Json<SearchBody>) -> H
             "retryable": true,
         }));
     };
-    let friend_set: HashSet<String> = match crate::utils::friends::try_friend_ids(&db, &user_id).await
-    {
-        Ok(ids) => ids.into_iter().collect(),
-        Err(()) => {
-            return HttpResponse::ServiceUnavailable().json(json!({
-                "message": "Temporarily unavailable",
-                "retryable": true,
-            }));
-        }
-    };
+    let friend_set: HashSet<String> =
+        match crate::utils::friends::try_friend_ids(&db, &user_id).await {
+            Ok(ids) => ids.into_iter().collect(),
+            Err(()) => {
+                return HttpResponse::ServiceUnavailable().json(json!({
+                    "message": "Temporarily unavailable",
+                    "retryable": true,
+                }));
+            }
+        };
 
     let mut results = Vec::with_capacity(matches.len());
     for c in &matches {
@@ -277,7 +279,9 @@ async fn dm_unread_counts_batch(
     loop {
         match cursor.try_next().await {
             Ok(Some(doc)) => {
-                let Ok(fid) = doc.get_object_id("_id") else { continue };
+                let Ok(fid) = doc.get_object_id("_id") else {
+                    continue;
+                };
                 let count = match doc.get("count") {
                     Some(mongodb::bson::Bson::Int64(n)) => (*n).max(0) as u64,
                     Some(mongodb::bson::Bson::Int32(n)) => (*n).max(0) as u64,
@@ -297,16 +301,13 @@ async fn dm_last_messages_batch(
     uid: ObjectId,
     friend_ids: &[ObjectId],
 ) -> Option<std::collections::HashMap<ObjectId, (DateTime, String, ObjectId, Option<u64>)>> {
-    let mut out =
-        crate::utils::tips::load_dm_tips_for_friends(db, uid, friend_ids).await?;
+    let mut out = crate::utils::tips::load_dm_tips_for_friends(db, uid, friend_ids).await?;
     let missing: Vec<ObjectId> = friend_ids
         .iter()
         .copied()
         .filter(|id| {
             out.get(id)
-                .map(|(ts, preview, _, _)| {
-                    preview.is_empty() && ts.timestamp_millis() == 0
-                })
+                .map(|(ts, preview, _, _)| preview.is_empty() && ts.timestamp_millis() == 0)
                 .unwrap_or(true)
         })
         .collect();
@@ -346,17 +347,23 @@ async fn dm_last_messages_batch(
         Ok(c) => c,
         Err(_) => return None,
     };
-    let mut filled: std::collections::HashMap<
-        ObjectId,
-        (DateTime, String, ObjectId, Option<u64>),
-    > = std::collections::HashMap::new();
+    let mut filled: std::collections::HashMap<ObjectId, (DateTime, String, ObjectId, Option<u64>)> =
+        std::collections::HashMap::new();
     loop {
         match cursor.try_next().await {
             Ok(Some(doc)) => {
-                let Ok(fid) = doc.get_object_id("_id") else { continue };
-                let Some(ts) = doc.get_datetime("timestamp").ok().copied() else { continue };
-                let Some(raw) = doc.get_str("content").ok() else { continue };
-                let Ok(mid) = doc.get_object_id("messageId") else { continue };
+                let Ok(fid) = doc.get_object_id("_id") else {
+                    continue;
+                };
+                let Some(ts) = doc.get_datetime("timestamp").ok().copied() else {
+                    continue;
+                };
+                let Some(raw) = doc.get_str("content").ok() else {
+                    continue;
+                };
+                let Ok(mid) = doc.get_object_id("messageId") else {
+                    continue;
+                };
                 let unread = out.get(&fid).and_then(|e| e.3);
                 filled.insert(
                     fid,
@@ -473,13 +480,10 @@ pub async fn get_contacts_for_list(req: HttpRequest) -> HttpResponse {
         .iter()
         .copied()
         .filter(|id| match last_map.get(id) {
-
             None => true,
             Some((_, _, _, None)) => true,
 
-            Some((ts, preview, _, Some(0))) => {
-                !(preview.is_empty() && ts.timestamp_millis() == 0)
-            }
+            Some((ts, preview, _, Some(0))) => !(preview.is_empty() && ts.timestamp_millis() == 0),
 
             Some((_, _, _, Some(n))) if *n > 0 => true,
             Some((_, _, _, Some(_))) => false,
@@ -523,12 +527,17 @@ pub async fn get_contacts_for_list(req: HttpRequest) -> HttpResponse {
             (last, unread)
         };
 
-        let last_time_ms = last.as_ref().map(|(t, _, _)| t.timestamp_millis()).unwrap_or(0);
+        let last_time_ms = last
+            .as_ref()
+            .map(|(t, _, _)| t.timestamp_millis())
+            .unwrap_or(0);
         let mut profile = friend_profile_json(friend);
         if let Some(obj) = profile.as_object_mut() {
             obj.insert(
                 "lastMessageTime".to_string(),
-                json!(last.as_ref().and_then(|(t, _, _)| t.try_to_rfc3339_string().ok())),
+                json!(last
+                    .as_ref()
+                    .and_then(|(t, _, _)| t.try_to_rfc3339_string().ok())),
             );
             obj.insert(
                 "lastMessage".to_string(),
@@ -610,8 +619,12 @@ pub async fn toggle_contact_mute(req: HttpRequest) -> HttpResponse {
                 .json(json!({ "message": "Internal Server Error" }));
         }
     };
-    if User::set_fields(&db, uid, doc! { "mutedContacts": muted_bson }).await.is_err() {
-        return HttpResponse::InternalServerError().json(json!({ "message": "Internal Server Error" }));
+    if User::set_fields(&db, uid, doc! { "mutedContacts": muted_bson })
+        .await
+        .is_err()
+    {
+        return HttpResponse::InternalServerError()
+            .json(json!({ "message": "Internal Server Error" }));
     }
 
     HttpResponse::Ok().json(json!({
@@ -740,8 +753,12 @@ pub async fn toggle_contact_block(req: HttpRequest) -> HttpResponse {
                 .json(json!({ "message": "Internal Server Error" }));
         }
     };
-    if User::set_fields(&db, uid, doc! { "blockedContacts": blocked_bson }).await.is_err() {
-        return HttpResponse::InternalServerError().json(json!({ "message": "Internal Server Error" }));
+    if User::set_fields(&db, uid, doc! { "blockedContacts": blocked_bson })
+        .await
+        .is_err()
+    {
+        return HttpResponse::InternalServerError()
+            .json(json!({ "message": "Internal Server Error" }));
     }
 
     invalidate_friend_ids_pair(&user_id, contact_id);
@@ -787,7 +804,10 @@ pub async fn delete_conversation(req: HttpRequest) -> HttpResponse {
         return HttpResponse::BadRequest().json(json!({ "message": "Missing user or contact id" }));
     }
 
-    let (Ok(uid), Ok(cid)) = (ObjectId::parse_str(&user_id), ObjectId::parse_str(contact_id)) else {
+    let (Ok(uid), Ok(cid)) = (
+        ObjectId::parse_str(&user_id),
+        ObjectId::parse_str(contact_id),
+    ) else {
         return HttpResponse::BadRequest().json(json!({ "message": "Missing user or contact id" }));
     };
 
@@ -813,25 +833,44 @@ pub async fn delete_conversation(req: HttpRequest) -> HttpResponse {
         ],
         "fileUrl": { "$exists": true, "$ne": null },
     };
-    let mut file_urls = match crate::utils::messages::search::message_file_urls(
-        &db,
-        conversation_files_filter,
-    )
-    .await
-    {
-        Ok(urls) => urls,
-        Err(e) => {
-            log::error!(
-                "delete_conversation: failed to read attachment URLs for {} / {}: {e}",
-                user_id,
-                contact_id
-            );
-            return HttpResponse::ServiceUnavailable().json(json!({
-                "message": "Failed to delete conversation",
-                "retryable": true,
-            }));
-        }
-    };
+    let mut file_urls =
+        match crate::utils::messages::search::message_file_urls(&db, conversation_files_filter)
+            .await
+        {
+            Ok(urls) => urls,
+            Err(e) => {
+                log::error!(
+                    "delete_conversation: failed to read attachment URLs for {} / {}: {e}",
+                    user_id,
+                    contact_id
+                );
+                return HttpResponse::ServiceUnavailable().json(json!({
+                    "message": "Failed to delete conversation",
+                    "retryable": true,
+                }));
+            }
+        };
+    let _deletion_guard =
+        match crate::utils::messages::conversation_writes::claim_deletion(&db, uid, cid).await {
+            Ok(Some(guard)) => guard,
+            Ok(None) => {
+                return HttpResponse::Conflict().json(json!({
+                    "message": "Conversation is already being modified. Retry shortly.",
+                    "retryable": true,
+                }));
+            }
+            Err(error) => {
+                log::error!(
+                    "delete_conversation: failed to claim conversation {} / {}: {error}",
+                    user_id,
+                    contact_id
+                );
+                return HttpResponse::ServiceUnavailable().json(json!({
+                    "message": "Failed to delete conversation",
+                    "retryable": true,
+                }));
+            }
+        };
     let live_filter = doc! {
         "$or": [
             { "sender": uid, "recipient": cid },
@@ -839,9 +878,9 @@ pub async fn delete_conversation(req: HttpRequest) -> HttpResponse {
         ],
         "deleted": { "$ne": true },
     };
-    let live_file_urls =
+    let wipe_result =
         match crate::utils::messages::search::wipe_live_messages(&db, live_filter).await {
-            Ok(urls) => urls,
+            Ok(result) => result,
             Err(e) => {
                 log::error!(
                     "delete_conversation: failed to wipe DM messages for {} / {}: {e}",
@@ -854,7 +893,8 @@ pub async fn delete_conversation(req: HttpRequest) -> HttpResponse {
                 }));
             }
         };
-    file_urls.extend(live_file_urls);
+    let wipe_pending = wipe_result.wipe_pending;
+    file_urls.extend(wipe_result.file_urls);
     file_urls.sort();
     file_urls.dedup();
 
@@ -862,19 +902,15 @@ pub async fn delete_conversation(req: HttpRequest) -> HttpResponse {
         .iter()
         .map(|url| cleanup_attachment_if_unreferenced(&db, Some(url)))
         .collect();
+    let mut cleanup_pending = false;
     for result in futures_util::future::join_all(cleanups).await {
         if let Err(e) = result {
             log::error!("Failed to clean up deleted conversation attachment: {e}");
-            return HttpResponse::ServiceUnavailable().json(json!({
-                "message": "Conversation messages were deleted, but attachment cleanup is incomplete.",
-                "retryable": true,
-            }));
+            cleanup_pending = true;
         }
     }
 
-    if let Some(session) =
-        crate::utils::voice::calls::take_session_for_pair(&user_id, contact_id)
-    {
+    if let Some(session) = crate::utils::voice::calls::take_session_for_pair(&user_id, contact_id) {
         let end_payload = json!({ "from": user_id, "reason": "CONVERSATION_DELETED" });
         match session.phase {
             crate::utils::voice::calls::CallPhase::Ringing => {
@@ -895,11 +931,7 @@ pub async fn delete_conversation(req: HttpRequest) -> HttpResponse {
                     "call:ended",
                     end_payload.clone(),
                 );
-                crate::ws::registry::emit_to_user(
-                    &session.caller_id,
-                    "call:ended",
-                    end_payload,
-                );
+                crate::ws::registry::emit_to_user(&session.caller_id, "call:ended", end_payload);
             }
         }
     }
@@ -917,7 +949,6 @@ pub async fn delete_conversation(req: HttpRequest) -> HttpResponse {
         .await
     {
         Ok(remaining) if remaining > 0 => {
-
             if let Ok(mut cursor) = Message::collection(&db)
                 .find(doc! {
                     "$or": [
@@ -934,10 +965,8 @@ pub async fn delete_conversation(req: HttpRequest) -> HttpResponse {
                     crate::utils::tips::upsert_dm_tip(&db, &msg).await;
                 }
             }
-            let synced_viewer =
-                crate::utils::tips::try_sync_dm_tip_unread(&db, uid, cid).await;
-            let synced_peer =
-                crate::utils::tips::try_sync_dm_tip_unread(&db, cid, uid).await;
+            let synced_viewer = crate::utils::tips::try_sync_dm_tip_unread(&db, uid, cid).await;
+            let synced_peer = crate::utils::tips::try_sync_dm_tip_unread(&db, cid, uid).await;
             match (synced_viewer, synced_peer) {
                 (Some(nv), Some(np)) => {
                     crate::utils::unread::emit_unread_absolute(&user_id, "dm", contact_id, nv);
@@ -950,7 +979,6 @@ pub async fn delete_conversation(req: HttpRequest) -> HttpResponse {
             }
         }
         Ok(_) => {
-
             match Message::collection(&db)
                 .count_documents(doc! {
                     "$or": [
@@ -962,7 +990,6 @@ pub async fn delete_conversation(req: HttpRequest) -> HttpResponse {
                 .await
             {
                 Ok(0) => {
-
                     let still_empty = Message::collection(&db)
                         .count_documents(doc! {
                             "$or": [
@@ -976,11 +1003,9 @@ pub async fn delete_conversation(req: HttpRequest) -> HttpResponse {
                         == Some(0);
                     if still_empty {
                         let synced_viewer =
-                            crate::utils::tips::try_sync_dm_tip_unread(&db, uid, cid)
-                                .await;
+                            crate::utils::tips::try_sync_dm_tip_unread(&db, uid, cid).await;
                         let synced_peer =
-                            crate::utils::tips::try_sync_dm_tip_unread(&db, cid, uid)
-                                .await;
+                            crate::utils::tips::try_sync_dm_tip_unread(&db, cid, uid).await;
                         match (synced_viewer, synced_peer) {
                             (Some(nv), Some(np)) => {
                                 crate::utils::unread::emit_unread_absolute(
@@ -1011,11 +1036,9 @@ pub async fn delete_conversation(req: HttpRequest) -> HttpResponse {
                         );
                     } else {
                         let synced_viewer =
-                            crate::utils::tips::try_sync_dm_tip_unread(&db, uid, cid)
-                                .await;
+                            crate::utils::tips::try_sync_dm_tip_unread(&db, uid, cid).await;
                         let synced_peer =
-                            crate::utils::tips::try_sync_dm_tip_unread(&db, cid, uid)
-                                .await;
+                            crate::utils::tips::try_sync_dm_tip_unread(&db, cid, uid).await;
                         match (synced_viewer, synced_peer) {
                             (Some(nv), Some(np)) => {
                                 crate::utils::unread::emit_unread_absolute(
@@ -1038,11 +1061,9 @@ pub async fn delete_conversation(req: HttpRequest) -> HttpResponse {
                 }
                 Ok(_) => {
                     let synced_viewer =
-                        crate::utils::tips::try_sync_dm_tip_unread(&db, uid, cid)
-                            .await;
+                        crate::utils::tips::try_sync_dm_tip_unread(&db, uid, cid).await;
                     let synced_peer =
-                        crate::utils::tips::try_sync_dm_tip_unread(&db, cid, uid)
-                            .await;
+                        crate::utils::tips::try_sync_dm_tip_unread(&db, cid, uid).await;
                     match (synced_viewer, synced_peer) {
                         (Some(nv), Some(np)) => {
                             crate::utils::unread::emit_unread_absolute(
@@ -1063,23 +1084,31 @@ pub async fn delete_conversation(req: HttpRequest) -> HttpResponse {
                     }
                 }
                 Err(_) => {
-
-                    crate::utils::unread::invalidate_unread_generation(
-                        &user_id, "dm", contact_id,
-                    );
-                    crate::utils::unread::invalidate_unread_generation(
-                        contact_id, "dm", &user_id,
-                    );
+                    crate::utils::unread::invalidate_unread_generation(&user_id, "dm", contact_id);
+                    crate::utils::unread::invalidate_unread_generation(contact_id, "dm", &user_id);
                 }
             }
         }
-        Err(_) => {
-            return HttpResponse::InternalServerError().json(json!({
-                "message": "Failed to delete conversation",
-                "retryable": true,
+        Err(error) => {
+            log::error!(
+                "delete_conversation: failed to verify remaining messages for {} / {}: {error}",
+                user_id,
+                contact_id
+            );
+            crate::utils::unread::invalidate_unread_generation(&user_id, "dm", contact_id);
+            crate::utils::unread::invalidate_unread_generation(contact_id, "dm", &user_id);
+            return HttpResponse::Ok().json(json!({
+                "message": "Conversation deleted",
+                "cleanupPending": cleanup_pending,
+                "wipePending": wipe_pending,
+                "syncPending": true,
             }));
         }
     }
 
-    HttpResponse::Ok().json(json!({ "message": "Conversation deleted" }))
+    HttpResponse::Ok().json(json!({
+        "message": "Conversation deleted",
+        "cleanupPending": cleanup_pending,
+        "wipePending": wipe_pending,
+    }))
 }

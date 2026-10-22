@@ -73,7 +73,9 @@ fn ftyp_brands(data: &[u8]) -> Vec<[u8; 4]> {
 
 fn ftyp_has_any(data: &[u8], wanted: &[&[u8; 4]]) -> bool {
     let brands = ftyp_brands(data);
-    brands.iter().any(|brand| wanted.iter().any(|w| brand == *w))
+    brands
+        .iter()
+        .any(|brand| wanted.iter().any(|w| brand == *w))
 }
 
 fn is_avif_container(data: &[u8]) -> bool {
@@ -184,9 +186,7 @@ pub fn mime_allowed_for_extension(ext: &str, mime: &str) -> bool {
         "webp" => mime == "image/webp",
         "heic" => matches!(mime.as_str(), "image/heic" | "image/heif"),
         "heif" => matches!(mime.as_str(), "image/heif" | "image/heic"),
-        "docx" => {
-            mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        }
+        "docx" => mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         "xlsx" => mime == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         "pptx" => {
             mime == "application/vnd.openxmlformats-officedocument.presentationml.presentation"
@@ -207,15 +207,16 @@ pub fn mime_allowed_for_extension(ext: &str, mime: &str) -> bool {
         "mp4" => {
             matches!(
                 mime.as_str(),
-                "audio/mp4" | "audio/aac" | "audio/x-m4a" | "video/mp4" | "video/quicktime"
+                "audio/mp4"
+                    | "audio/aac"
+                    | "audio/x-m4a"
+                    | "video/mp4"
+                    | "video/quicktime"
                     | "application/mp4"
             )
         }
         "m4a" => {
-            matches!(
-                mime.as_str(),
-                "audio/mp4" | "audio/aac" | "audio/x-m4a"
-            )
+            matches!(mime.as_str(), "audio/mp4" | "audio/aac" | "audio/x-m4a")
         }
         _ => false,
     }

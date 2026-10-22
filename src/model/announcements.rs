@@ -96,11 +96,7 @@ impl Announcement {
             .create_index(
                 IndexModel::builder()
                     .keys(doc! { "userId": 1, "announcementId": 1 })
-                    .options(
-                        IndexOptions::builder()
-                            .unique(true)
-                            .build(),
-                    )
+                    .options(IndexOptions::builder().unique(true).build())
                     .build(),
             )
             .await?;
@@ -112,8 +108,7 @@ impl Announcement {
         db: &Database,
         input: CreateAnnouncementInput,
     ) -> mongodb::error::Result<Announcement> {
-        validate_announcement(&input.title, &input.body)
-            .map_err(mongodb::error::Error::custom)?;
+        validate_announcement(&input.title, &input.body).map_err(mongodb::error::Error::custom)?;
 
         let now = DateTime::now();
         let announcement = Announcement {
@@ -185,9 +180,7 @@ impl Announcement {
     }
 
     pub async fn delete_by_id(db: &Database, id: ObjectId) -> mongodb::error::Result<bool> {
-        let result = Self::collection(db)
-            .delete_one(doc! { "_id": id })
-            .await?;
+        let result = Self::collection(db).delete_one(doc! { "_id": id }).await?;
         AnnouncementDismissal::collection(db)
             .delete_many(doc! { "announcementId": id })
             .await?;

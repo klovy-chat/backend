@@ -92,11 +92,7 @@ pub async fn verify_token(
         }
     };
 
-    let payload = match decode::<TokenPayload>(
-        &token,
-        &jwt_key,
-        &hs256_validation(),
-    ) {
+    let payload = match decode::<TokenPayload>(&token, &jwt_key, &hs256_validation()) {
         Ok(data) => data.claims,
         Err(err) => {
             let (req, _) = req.into_parts();
@@ -137,7 +133,8 @@ pub async fn verify_token(
         }
     }
 
-    req.extensions_mut().insert(RequestUserId(payload.user_id.clone()));
+    req.extensions_mut()
+        .insert(RequestUserId(payload.user_id.clone()));
 
     Ok(next.call(req).await?.map_into_boxed_body())
 }
@@ -198,8 +195,8 @@ pub async fn require_active_account(
         Some(id) => id,
         None => {
             let (req, _) = req.into_parts();
-            let res = HttpResponse::Unauthorized()
-                .json(serde_json::json!({ "error": "User not found" }));
+            let res =
+                HttpResponse::Unauthorized().json(serde_json::json!({ "error": "User not found" }));
             return Ok(ServiceResponse::new(req, res));
         }
     };
@@ -209,8 +206,8 @@ pub async fn require_active_account(
         Ok(Some(u)) => u,
         Ok(None) => {
             let (req, _) = req.into_parts();
-            let res = HttpResponse::Unauthorized()
-                .json(serde_json::json!({ "error": "User not found" }));
+            let res =
+                HttpResponse::Unauthorized().json(serde_json::json!({ "error": "User not found" }));
             return Ok(ServiceResponse::new(req, res));
         }
         Err(_) => {
@@ -238,7 +235,11 @@ pub fn log_suspicious_activity(
     ServiceRequest,
     Next<actix_web::body::BoxBody>,
 ) -> std::pin::Pin<
-    Box<dyn std::future::Future<Output = Result<ServiceResponse<actix_web::body::BoxBody>, actix_web::Error>>>
+    Box<
+        dyn std::future::Future<
+            Output = Result<ServiceResponse<actix_web::body::BoxBody>, actix_web::Error>,
+        >,
+    >,
 > + Clone {
     move |req: ServiceRequest, next: Next<actix_web::body::BoxBody>| {
         Box::pin(async move {
@@ -322,7 +323,6 @@ pub fn log_suspicious_activity(
                     Regex::new(r"(?i)constructor.*prototype").unwrap(),
                     Regex::new(r"(?i)none.*algorithm").unwrap(),
                 ];
-
                 static ref SUSPICIOUS_HEADERS: Vec<&'static str> = vec![
                     "x-forwarded-for",
                     "x-real-ip",

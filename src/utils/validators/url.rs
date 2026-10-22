@@ -82,14 +82,10 @@ mod tests {
         assert!(is_allowed_external_media_url(
             "https://media.giphy.com/media/abc/giphy.gif"
         ));
-        assert!(is_allowed_external_media_url(
-            "https://i.imgur.com/abc.png"
-        ));
+        assert!(is_allowed_external_media_url("https://i.imgur.com/abc.png"));
         assert!(!is_allowed_external_media_url("https://i.imgur.com/"));
         assert!(
-            !is_allowed_external_media_url(
-                "https://cdn.klovy.chat/attachments/dm/x/y.webp"
-            ),
+            !is_allowed_external_media_url("https://cdn.klovy.chat/attachments/dm/x/y.webp"),
             "own CDN must not skip the attachment scan path"
         );
     }

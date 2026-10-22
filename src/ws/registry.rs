@@ -14,8 +14,8 @@ use std::time::Duration;
 use once_cell::sync::OnceCell;
 use serde::Serialize;
 use serde_json::{json, Value};
-use tokio::sync::{Mutex, mpsc, watch};
 use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::{mpsc, watch, Mutex};
 
 use crate::model::channels::Channel;
 
@@ -206,7 +206,8 @@ impl ConnectionRegistry {
     }
 
     pub async fn broadcast_to_all(&self, msg_type: &str, payload: Value) {
-        let Ok(msg) = serde_json::to_string(&json!({ "type": msg_type, "payload": payload })) else {
+        let Ok(msg) = serde_json::to_string(&json!({ "type": msg_type, "payload": payload }))
+        else {
             return;
         };
         let user_ids: Vec<String> = self.connections.lock().await.keys().cloned().collect();

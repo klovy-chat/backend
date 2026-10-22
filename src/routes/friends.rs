@@ -10,8 +10,9 @@ use actix_web::web;
 use actix_web_lab::middleware::from_fn;
 
 use crate::controllers::friends::{
-    accept_friend_request, cancel_friend_request, check_friendship, get_friends, get_received_requests,
-    get_sent_requests, reject_friend_request, remove_friend, send_friend_request,
+    accept_friend_request, cancel_friend_request, check_friendship, get_friends,
+    get_received_requests, get_sent_requests, reject_friend_request, remove_friend,
+    send_friend_request,
 };
 use crate::middlewares::auth::{require_active_account, verify_token};
 use crate::utils::ratelimit::{discovery_limiter, friend_action_limiter, friend_request_limiter};

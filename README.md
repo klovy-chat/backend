@@ -16,6 +16,8 @@ Backend obsługuje aplikację Klovy Chat: konta, kanały, wiadomości, znajomych
 
 Publiczny ruch wchodzi na Axum (CORS, proxy, limity). Wewnętrzne API i upgrade WebSocket obsługuje Actix-web. Załączniki lądują w Cloudflare R2 (osobny bucket kwarantanny), a ClamAV skanuje je zanim trafią na CDN.
 
+Przerwane usuwanie kanału jest automatycznie wznawiane po starcie backendu i przez cykliczny worker; kanał pozostaje niedostępny do czasu zakończenia sprzątania.
+
 ### Ekosystem
 
 | Repo | Rola |
@@ -159,7 +161,25 @@ backend/
 └── .env.example             # Szablon środowiska (lokalny start)
 ```
 
-Binarka: `klovy-chat-server`. Narzędzie migracji: `encrypt-old-messages`.
+Binarka: `klovy-chat-server`. Narzędzia migracji: `encrypt-old-messages`, `migrate-storage-usage`, `migrate-friend-request-pairs`.
+
+Przed wdrożeniem aktualizacji backendu można sprawdzić i scalić historyczne duplikaty liczników storage:
+
+```bash
+cargo run --bin migrate-storage-usage -- --dry-run
+cargo run --bin migrate-storage-usage -- --apply
+```
+
+`--dry-run` jest domyślne. `--apply` sumuje wartości rekordów dla tego samego użytkownika i tworzy unikalny indeks `userId`. Uruchamiaj tryb `--apply` przy zatrzymanych instancjach backendu; nowy backend wykonuje tę idempotentną migrację również podczas inicjalizacji indeksów.
+
+Przed wdrożeniem indeksu unikalnego dla par zaproszeń uruchom migrację:
+
+```bash
+cargo run --bin migrate-friend-request-pairs -- --dry-run
+cargo run --bin migrate-friend-request-pairs -- --apply
+```
+
+`--dry-run` jest domyślne. Migracja uzupełnia klucz pary tylko wtedy, gdy w kolekcji istnieje dokładnie jeden dokument dla tej pary, a następnie tworzy indeks unikalny. Historyczne duplikaty są raportowane i pozostawiane bez zmian do ręcznego rozstrzygnięcia — migracja ich nie scala ani nie usuwa; jeśli wykryje je w trybie `--apply`, przerwie się przed zapisem i tworzeniem indeksu. Uruchamiaj `--apply` przy zatrzymanych instancjach backendu, przed wdrożeniem nowej wersji.
 
 ---
 

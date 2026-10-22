@@ -124,7 +124,10 @@ pub fn encrypt_field(plain: &str) -> Result<String, String> {
     let mut out = Vec::with_capacity(NONCE_LEN + ciphertext.len());
     out.extend_from_slice(&nonce_bytes);
     out.extend_from_slice(&ciphertext);
-    Ok(base32::encode(base32::Alphabet::Rfc4648 { padding: false }, &out))
+    Ok(base32::encode(
+        base32::Alphabet::Rfc4648 { padding: false },
+        &out,
+    ))
 }
 
 pub fn decrypt_field(encoded: &str) -> Result<String, String> {

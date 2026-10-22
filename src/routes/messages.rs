@@ -10,12 +10,10 @@ use actix_web::web;
 use actix_web_lab::middleware::from_fn;
 
 use crate::controllers::messages::{
-    delete_message, edit_message, get_messages, get_pinned_messages,
-    link_preview, pin_message, search_messages, unpin_message, upload_file,
+    delete_message, edit_message, get_messages, get_pinned_messages, link_preview, pin_message,
+    search_messages, unpin_message, upload_file,
 };
-use crate::middlewares::auth::{
-    log_suspicious_activity, require_active_account, verify_token,
-};
+use crate::middlewares::auth::{log_suspicious_activity, require_active_account, verify_token};
 use crate::utils::ratelimit::{discovery_limiter, pin_message_limiter, upload_limiter};
 
 pub fn configure(cfg: &mut web::ServiceConfig) {

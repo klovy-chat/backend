@@ -144,7 +144,6 @@ pub async fn upsert_dm_tip(db: &Database, msg: &Message) {
         .with_options(UpdateOptions::builder().upsert(true).build())
         .await
     {
-
         log::warn!("upsert_dm_tip failed pair={pair_key}: {e}");
     }
 }
@@ -191,7 +190,10 @@ pub async fn upsert_channel_tip(db: &Database, channel_id: ObjectId, msg: &Messa
         )
         .await
     {
-        log::warn!("upsert_channel_tip failed channel={}: {e}", channel_id.to_hex());
+        log::warn!(
+            "upsert_channel_tip failed channel={}: {e}",
+            channel_id.to_hex()
+        );
     }
 }
 
@@ -237,7 +239,11 @@ pub async fn set_dm_unread(db: &Database, viewer: ObjectId, peer: ObjectId, unre
     }
 }
 
-async fn tip_unread_field(db: &Database, viewer: ObjectId, peer: ObjectId) -> Result<Option<u64>, ()> {
+async fn tip_unread_field(
+    db: &Database,
+    viewer: ObjectId,
+    peer: ObjectId,
+) -> Result<Option<u64>, ()> {
     let (pair_key, user_a, _) = dm_pair_key(viewer, peer);
     let tip = match DmConversationTip::collection(db)
         .find_one(doc! { "pairKey": &pair_key })
@@ -348,7 +354,6 @@ pub async fn refresh_dm_tip_after_delete(
     match latest {
         Some(msg) => upsert_dm_tip(db, &msg).await,
         None => {
-
             let _ = DmConversationTip::collection(db)
                 .delete_one(doc! { "pairKey": pair_key, "lastMessageId": deleted_id })
                 .await;

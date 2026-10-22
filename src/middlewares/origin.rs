@@ -36,14 +36,8 @@ pub async fn origin_guard_middleware(
     };
 
     let allowed = allowed_origins();
-    let origin = req
-        .headers()
-        .get("origin")
-        .and_then(|v| v.to_str().ok());
-    let referer = req
-        .headers()
-        .get("referer")
-        .and_then(|v| v.to_str().ok());
+    let origin = req.headers().get("origin").and_then(|v| v.to_str().ok());
+    let referer = req.headers().get("referer").and_then(|v| v.to_str().ok());
 
     if !validate_browser_origin_values(origin, referer, &allowed, mode) {
         let (req, _) = req.into_parts();

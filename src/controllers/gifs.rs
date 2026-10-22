@@ -77,7 +77,10 @@ fn normalize(gifs: &[Value]) -> Vec<Value> {
         .collect()
 }
 
-async fn fetch_from_giphy(path: &str, params: &[(&str, String)]) -> Result<Vec<Value>, HttpResponse> {
+async fn fetch_from_giphy(
+    path: &str,
+    params: &[(&str, String)],
+) -> Result<Vec<Value>, HttpResponse> {
     let url = format!("{}{}", GIPHY_BASE_URL, path);
     let resp = match crate::utils::http::outbound_http_client()
         .get(&url)

@@ -78,7 +78,10 @@ fn resize_to_max_edge(img: image::DynamicImage, max_edge: u32) -> image::Dynamic
     img.resize(max_edge, max_edge, FilterType::Triangle)
 }
 
-fn encode_lossy_webp(img: &image::DynamicImage, quality: f32) -> Result<Vec<u8>, ImageReencodeError> {
+fn encode_lossy_webp(
+    img: &image::DynamicImage,
+    quality: f32,
+) -> Result<Vec<u8>, ImageReencodeError> {
     let rgba = img.to_rgba8();
     let (width, height) = rgba.dimensions();
     let encoder = webp::Encoder::from_rgba(rgba.as_raw(), width, height);
@@ -89,29 +92,19 @@ fn encode_lossy_webp(img: &image::DynamicImage, quality: f32) -> Result<Vec<u8>,
     Ok(encoded.to_vec())
 }
 
-pub fn reencode_upload_to_webp_variants(source: &Path) -> Result<EncodedImageVariants, ImageReencodeError> {
+pub fn reencode_upload_to_webp_variants(
+    source: &Path,
+) -> Result<EncodedImageVariants, ImageReencodeError> {
     let bytes = std::fs::read(source).map_err(|_| ImageReencodeError::IoFailed)?;
     let (width, height) = read_image_dimensions(&bytes)?;
     ensure_source_dimensions_ok(width, height)?;
     let img = image::load_from_memory(&bytes).map_err(|_| ImageReencodeError::DecodeFailed)?;
 
-    let full_img = resize_to_max_edge(
-        img,
-        crate::utils::upload::MAX_CHAT_IMAGE_EDGE,
-    );
-    let thumb_img = resize_to_max_edge(
-        full_img.clone(),
-        crate::utils::upload::MAX_CHAT_THUMB_EDGE,
-    );
+    let full_img = resize_to_max_edge(img, crate::utils::upload::MAX_CHAT_IMAGE_EDGE);
+    let thumb_img = resize_to_max_edge(full_img.clone(), crate::utils::upload::MAX_CHAT_THUMB_EDGE);
 
-    let full = encode_lossy_webp(
-        &full_img,
-        crate::utils::upload::CHAT_IMAGE_WEBP_QUALITY,
-    )?;
-    let thumb = encode_lossy_webp(
-        &thumb_img,
-        crate::utils::upload::CHAT_THUMB_WEBP_QUALITY,
-    )?;
+    let full = encode_lossy_webp(&full_img, crate::utils::upload::CHAT_IMAGE_WEBP_QUALITY)?;
+    let thumb = encode_lossy_webp(&thumb_img, crate::utils::upload::CHAT_THUMB_WEBP_QUALITY)?;
 
     Ok(EncodedImageVariants { full, thumb })
 }
@@ -137,13 +130,12 @@ pub fn reencode_upload_to_webp_max_edge(
     ensure_source_dimensions_ok(width, height)?;
     let img = image::load_from_memory(&bytes).map_err(|_| ImageReencodeError::DecodeFailed)?;
     let resized = resize_to_max_edge(img, max_edge);
-    encode_lossy_webp(
-        &resized,
-        crate::utils::upload::AVATAR_WEBP_QUALITY,
-    )
+    encode_lossy_webp(&resized, crate::utils::upload::AVATAR_WEBP_QUALITY)
 }
 
-pub async fn reencode_upload_to_webp_async(source: std::path::PathBuf) -> Result<Vec<u8>, ImageReencodeError> {
+pub async fn reencode_upload_to_webp_async(
+    source: std::path::PathBuf,
+) -> Result<Vec<u8>, ImageReencodeError> {
     tokio::task::spawn_blocking(move || reencode_upload_to_webp(&source))
         .await
         .map_err(|_| ImageReencodeError::IoFailed)?

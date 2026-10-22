@@ -47,7 +47,13 @@ fn extract_platform_primary_segment(ua: &str) -> Option<String> {
     }
 
     let noise = [
-        "X11", "WOW64", "Win64", "U", "Mobile", "Tablet", "compatible",
+        "X11",
+        "WOW64",
+        "Win64",
+        "U",
+        "Mobile",
+        "Tablet",
+        "compatible",
     ];
 
     inner
@@ -65,13 +71,24 @@ fn is_version_token(token: &str) -> bool {
     if token.is_empty() {
         return true;
     }
-    token.chars().all(|c| c.is_ascii_digit() || c == '.' || c == '_')
+    token
+        .chars()
+        .all(|c| c.is_ascii_digit() || c == '.' || c == '_')
 }
 
 fn is_arch_token(token: &str) -> bool {
     matches!(
         token.to_ascii_lowercase().as_str(),
-        "x86" | "x86_64" | "x64" | "amd64" | "i686" | "arm64" | "aarch64" | "wow64" | "64-bit" | "32-bit"
+        "x86"
+            | "x86_64"
+            | "x64"
+            | "amd64"
+            | "i686"
+            | "arm64"
+            | "aarch64"
+            | "wow64"
+            | "64-bit"
+            | "32-bit"
     )
 }
 
@@ -160,11 +177,9 @@ fn fallback_from_user_agent(ua: &str) -> ClientInfo {
         };
     }
 
-    let browser = extract_browser_from_user_agent(trimmed)
-        .unwrap_or_else(|| "Unknown browser".to_string());
-    let os = simplify_os_label(
-        &extract_platform_from_user_agent(trimmed).unwrap_or_default(),
-    );
+    let browser =
+        extract_browser_from_user_agent(trimmed).unwrap_or_else(|| "Unknown browser".to_string());
+    let os = simplify_os_label(&extract_platform_from_user_agent(trimmed).unwrap_or_default());
     let os = if os.is_empty() {
         "Unknown OS".to_string()
     } else {
@@ -214,7 +229,11 @@ fn detect_os_family(value: &str) -> Option<&'static str> {
     let lower = value.to_ascii_lowercase();
     if lower.contains("android") {
         Some("android")
-    } else if lower.contains("iphone") || lower.contains("ipad") || lower.contains("ipod") || lower.contains("ios") {
+    } else if lower.contains("iphone")
+        || lower.contains("ipad")
+        || lower.contains("ipod")
+        || lower.contains("ios")
+    {
         Some("ios")
     } else if lower.contains("cros") || lower.contains("chrome os") {
         Some("chromeos")
@@ -235,9 +254,7 @@ pub fn resolved_os_label(reported_os: &str, ua: &str) -> String {
         return simplified;
     }
 
-    let from_ua = simplify_os_label(
-        &extract_platform_from_user_agent(ua).unwrap_or_default(),
-    );
+    let from_ua = simplify_os_label(&extract_platform_from_user_agent(ua).unwrap_or_default());
     if from_ua.is_empty() {
         "Unknown OS".to_string()
     } else {

@@ -58,7 +58,10 @@ pub struct DismissAnnouncementsBody {
     pub announcement_ids: Option<Vec<String>>,
 }
 
-pub async fn dismiss_announcements(req: HttpRequest, body: web::Json<DismissAnnouncementsBody>) -> HttpResponse {
+pub async fn dismiss_announcements(
+    req: HttpRequest,
+    body: web::Json<DismissAnnouncementsBody>,
+) -> HttpResponse {
     let Some(user_id) = request_user_id(&req) else {
         return HttpResponse::Unauthorized().json(json!({ "error": "User not authenticated." }));
     };

@@ -17,7 +17,5 @@ pub fn database_url() -> Result<String, String> {
             }
         }
     }
-    Err(
-        "Database URL is not configured (set DATABASE_URL, MONGODB_URI, or MONGO_URI)".to_string(),
-    )
+    Err("Database URL is not configured (set DATABASE_URL, MONGODB_URI, or MONGO_URI)".to_string())
 }

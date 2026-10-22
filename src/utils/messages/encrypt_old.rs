@@ -58,9 +58,7 @@ pub fn message_content_needs_seal_migration(stored: &str) -> bool {
     true
 }
 
-pub fn seal_legacy_message_content(
-    stored: &str,
-) -> Result<Option<String>, String> {
+pub fn seal_legacy_message_content(stored: &str) -> Result<Option<String>, String> {
     if !message_content_needs_seal_migration(stored) {
         return Ok(None);
     }

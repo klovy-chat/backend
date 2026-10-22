@@ -49,9 +49,7 @@ impl ScanVerdict {
         if hash.is_empty() {
             return Ok(None);
         }
-        let doc = Self::collection(db)
-            .find_one(doc! { "_id": hash })
-            .await?;
+        let doc = Self::collection(db).find_one(doc! { "_id": hash }).await?;
         Ok(doc.and_then(|row| match row.verdict {
             ScanStatus::Blocked => Some(ScanStatus::Blocked),
             ScanStatus::Clean if row.via_clamd => Some(ScanStatus::Clean),

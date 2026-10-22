@@ -7,13 +7,13 @@
 // Przy zmianach: routes/mod.rs.
 
 pub mod announcements;
-pub mod info;
 pub mod auth;
 pub mod channels;
 pub mod contacts;
 pub mod emojis;
 pub mod friends;
 pub mod gifs;
+pub mod info;
 pub mod invites;
 pub mod messages;
 pub mod stickers;

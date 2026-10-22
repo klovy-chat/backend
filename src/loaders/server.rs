@@ -16,37 +16,34 @@ use actix_web_lab::middleware::from_fn;
 use std::env;
 
 use crate::routes::{
-    auth, channels, contacts, emojis,
-    friends, gifs, invites, messages,
-    stickers, users, voice,
+    auth, channels, contacts, emojis, friends, gifs, invites, messages, stickers, users, voice,
 };
 
 use crate::middlewares::{
     client::client_guard_middleware,
     csrf::csrf_middleware,
-    proxy::{proxy, internal_proxy_secret, INTERNAL_PROXY_HEADER},
     ip_block::{ip_blocker_middleware, track_suspicious_activity, IPBlockerArc},
     origin::origin_guard_middleware,
+    proxy::{internal_proxy_secret, proxy, INTERNAL_PROXY_HEADER},
 };
 
 use crate::utils::ratelimit::{
     auth_rate_limiter, edge_http_allowed, global_limiter, send_limiter, try_acquire_http_slot,
     HTTP_EDGE_TIMEOUT,
 };
-use actix_multipart::form::MultipartFormConfig;
 use crate::utils::upload::{
     max_proxy_body_bytes, MAX_HTTP_BODY_BYTES, MAX_JSON_PAYLOAD_BYTES, MAX_PROXY_URI_BYTES,
 };
+use actix_multipart::form::MultipartFormConfig;
 
 use crate::utils::validators::{
-    sanitize::sanitize_input_middleware,
-    json::validate_json_payload_middleware,
+    json::validate_json_payload_middleware, sanitize::sanitize_input_middleware,
 };
 
 use crate::controllers::info::get_api_info;
-use crate::utils::security::timing::constant_time_eq_str;
-use crate::utils::security::origin::{allowed_origins, is_cors_response_header};
 use crate::utils::security::monitor::{SecurityEventType, SecurityMonitor};
+use crate::utils::security::origin::{allowed_origins, is_cors_response_header};
+use crate::utils::security::timing::constant_time_eq_str;
 
 pub async fn security_headers_middleware(
     req: ServiceRequest,
@@ -103,9 +100,8 @@ pub async fn security_headers_middleware(
         );
     }
 
-    let csp = crate::utils::security::csp::content_security_policy(
-        crate::utils::env::is_production(),
-    );
+    let csp =
+        crate::utils::security::csp::content_security_policy(crate::utils::env::is_production());
     if let Ok(value) = header::HeaderValue::from_str(&csp) {
         headers.insert(
             header::HeaderName::from_static("content-security-policy"),
@@ -174,8 +170,8 @@ pub async fn suspicious_request_middleware(
         );
 
         let (req, _payload) = req.into_parts();
-        let res = HttpResponse::BadRequest()
-            .json(serde_json::json!({ "error": "Invalid request" }));
+        let res =
+            HttpResponse::BadRequest().json(serde_json::json!({ "error": "Invalid request" }));
         return Ok(ServiceResponse::new(req, res).map_into_boxed_body());
     }
 
@@ -195,10 +191,10 @@ pub async fn security_report_handler(
     if secret.trim().is_empty() {
         return HttpResponse::NotFound().json(serde_json::json!({ "error": "Not found" }));
     }
-    let expected = format!("Bearer {}", secret);
 
+    let expected = secret.trim();
     match auth_header {
-        Some(h) if constant_time_eq_str(h, &expected) => {
+        Some(h) if constant_time_eq_str(h, expected) => {
             let report = security_monitor.get_security_report();
             HttpResponse::Ok().json(report)
         }
@@ -237,10 +233,7 @@ pub fn create_app(
                     actix_web::error::InternalError::from_response(err, response).into()
                 }),
         )
-        .app_data(
-            web::FormConfig::default()
-                .limit(MAX_JSON_PAYLOAD_BYTES as usize),
-        )
+        .app_data(web::FormConfig::default().limit(MAX_JSON_PAYLOAD_BYTES as usize))
         .app_data(
             MultipartFormConfig::default()
                 .total_limit(MAX_HTTP_BODY_BYTES)
@@ -261,10 +254,7 @@ pub fn create_app(
         .service(web::resource("/").route(web::get().to(get_api_info)))
         .service(web::resource("/api").route(web::get().to(get_api_info)))
         .service(web::resource("/api/").route(web::get().to(get_api_info)))
-        .service(
-            web::scope("/api/auth")
-                .configure(auth::configure),
-        )
+        .service(web::scope("/api/auth").configure(auth::configure))
         .service(
             web::scope("/api/channel")
                 .wrap(from_fn(send_limiter))
@@ -275,14 +265,8 @@ pub fn create_app(
                 .wrap(from_fn(send_limiter))
                 .configure(channels::configure),
         )
-        .service(
-            web::scope("/api/contacts")
-                .configure(contacts::configure),
-        )
-        .service(
-            web::scope("/api/contact")
-                .configure(contacts::configure),
-        )
+        .service(web::scope("/api/contacts").configure(contacts::configure))
+        .service(web::scope("/api/contact").configure(contacts::configure))
         .service(
             web::scope("/api/messages")
                 .wrap(from_fn(send_limiter))
@@ -293,14 +277,8 @@ pub fn create_app(
                 .wrap(from_fn(send_limiter))
                 .configure(messages::configure),
         )
-        .service(
-            web::scope("/api/friends")
-                .configure(friends::configure),
-        )
-        .service(
-            web::scope("/api/friend")
-                .configure(friends::configure),
-        )
+        .service(web::scope("/api/friends").configure(friends::configure))
+        .service(web::scope("/api/friend").configure(friends::configure))
         .service(
             web::scope("/api/gifs")
                 .wrap(from_fn(send_limiter))
@@ -316,14 +294,8 @@ pub fn create_app(
                 .wrap(from_fn(send_limiter))
                 .configure(stickers::configure),
         )
-        .service(
-            web::scope("/api/emojis")
-                .configure(emojis::configure),
-        )
-        .service(
-            web::scope("/api/emoji")
-                .configure(emojis::configure),
-        )
+        .service(web::scope("/api/emojis").configure(emojis::configure))
+        .service(web::scope("/api/emoji").configure(emojis::configure))
         .service(
             web::scope("/api/voice")
                 .wrap(from_fn(send_limiter))
@@ -334,14 +306,8 @@ pub fn create_app(
                 .wrap(from_fn(send_limiter))
                 .configure(voice::configure),
         )
-        .service(
-            web::scope("/api/user")
-                .configure(users::configure),
-        )
-        .service(
-            web::scope("/api/users")
-                .configure(users::configure),
-        )
+        .service(web::scope("/api/user").configure(users::configure))
+        .service(web::scope("/api/users").configure(users::configure))
         .service(
             web::scope("/api/security")
                 .wrap(from_fn(auth_rate_limiter))
@@ -349,14 +315,8 @@ pub fn create_app(
                 .service(web::resource("/").route(web::get().to(security_report_handler)))
                 .route("/report", web::get().to(security_report_handler)),
         )
-        .service(
-            web::scope("/api/invite")
-                .configure(invites::configure),
-        )
-        .service(
-            web::scope("/api/invites")
-                .configure(invites::configure),
-        )
+        .service(web::scope("/api/invite").configure(invites::configure))
+        .service(web::scope("/api/invites").configure(invites::configure))
         .default_service(web::to(not_found_handler))
 }
 
@@ -523,7 +483,6 @@ pub async fn run_server() -> std::io::Result<()> {
             Method::DELETE,
             Method::OPTIONS,
         ])
-
         .allow_headers(CORS_ALLOWED_REQUEST_HEADERS)
         .expose_headers([
             header::CONTENT_DISPOSITION,
@@ -603,7 +562,9 @@ pub async fn run_server() -> std::io::Result<()> {
                 ),
             );
             if let Ok(value) = http::HeaderValue::from_str(&retry_after.to_string()) {
-                response.headers_mut().insert(http::header::RETRY_AFTER, value);
+                response
+                    .headers_mut()
+                    .insert(http::header::RETRY_AFTER, value);
             }
             return Ok(response);
         }
@@ -653,116 +614,118 @@ pub async fn run_server() -> std::io::Result<()> {
         };
 
         let proxy_work = async {
-        let body_bytes = match axum::body::to_bytes(body, max_body).await {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                return Ok(Response::builder()
-                    .status(http::StatusCode::PAYLOAD_TOO_LARGE)
-                    .header(http::header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"error":"Payload too large"}"#))
-                    .unwrap_or_else(|_| Response::new(Body::empty())));
-            }
-        };
-        let body_len = body_bytes.len();
-
-        fn should_strip_request_header(name: &str) -> bool {
-            matches!(
-                name,
-                "host"
-                    | "content-length"
-                    | "transfer-encoding"
-                    | "content-encoding"
-                    | "connection"
-                    | "keep-alive"
-                    | "te"
-                    | "trailer"
-                    | "upgrade"
-                    | "x-real-ip"
-                    | "x-forwarded-for"
-                    | "x-forwarded-proto"
-                    | "cf-connecting-ip"
-                    | "true-client-ip"
-            )
-        }
-
-        let mut rb = client.request(method, &url).body(body_bytes);
-        for (name, value) in parts.headers.iter() {
-            let name_str = name.as_str();
-            if should_strip_request_header(name_str) {
-                continue;
-            }
-            rb = rb.header(name, value);
-        }
-
-        rb = rb.header("X-Real-IP", &client_ip);
-        rb = rb.header("X-Forwarded-For", &client_ip);
-        if crate::utils::security::transport::proxy_headers_indicate_https(&parts.headers) {
-            rb = rb.header("X-Forwarded-Proto", "https");
-        } else if let Some(proto) = parts
-            .headers
-            .get("x-forwarded-proto")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.split(',').next())
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-        {
-            rb = rb.header("X-Forwarded-Proto", proto);
-        }
-        if let Some(secret) = internal_proxy_secret() {
-            rb = rb.header(INTERNAL_PROXY_HEADER, secret);
-        }
-
-        match rb.send().await {
-            Ok(resp) => {
-                let status = resp.status();
-                let headers = resp.headers().clone();
-                let bytes = match crate::utils::http::read_response_limited(
-                    resp,
-                    crate::utils::http::MAX_PROXY_RESPONSE_BYTES,
-                )
-                .await
-                {
-                    Ok(bytes) => bytes,
-                    Err(crate::utils::http::LimitedBodyError::TooLarge) => {
-                        log::error!(
-                            "HTTP proxy response too large path={path} body_bytes={body_len}"
-                        );
-                        return Ok(Response::builder()
-                            .status(http::StatusCode::BAD_GATEWAY)
-                            .header(http::header::CONTENT_TYPE, "application/json")
-                            .body(Body::from(
-                                r#"{"error":"Bad Gateway","detail":"internal proxy"}"#,
-                            ))
-                            .unwrap_or_else(|_| Response::new(Body::empty())));
-                    }
-                    Err(_) => Vec::new(),
-                };
-                let mut builder = Response::builder().status(status);
-                for (k, v) in headers.iter() {
-                    if k == http::header::TRANSFER_ENCODING {
-                        continue;
-                    }
-
-                    if is_cors_response_header(k.as_str()) {
-                        continue;
-                    }
-                    builder = builder.header(k, v);
+            let body_bytes = match axum::body::to_bytes(body, max_body).await {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    return Ok(Response::builder()
+                        .status(http::StatusCode::PAYLOAD_TOO_LARGE)
+                        .header(http::header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(r#"{"error":"Payload too large"}"#))
+                        .unwrap_or_else(|_| Response::new(Body::empty())));
                 }
-                Ok(builder
-                    .body(Body::from(bytes))
-                    .unwrap_or_else(|_| Response::new(Body::empty())))
+            };
+            let body_len = body_bytes.len();
+
+            fn should_strip_request_header(name: &str) -> bool {
+                matches!(
+                    name,
+                    "host"
+                        | "content-length"
+                        | "transfer-encoding"
+                        | "content-encoding"
+                        | "connection"
+                        | "keep-alive"
+                        | "te"
+                        | "trailer"
+                        | "upgrade"
+                        | "x-real-ip"
+                        | "x-forwarded-for"
+                        | "x-forwarded-proto"
+                        | "cf-connecting-ip"
+                        | "true-client-ip"
+                )
             }
-            Err(e) => {
-                log::error!(
-                    "HTTP proxy to actix failed path={path} body_bytes={body_len}: {e}"
-                );
-                Ok(Response::builder()
-                    .status(http::StatusCode::BAD_GATEWAY)
-                    .header(http::header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"error":"Bad Gateway","detail":"internal proxy"}"#))
-                    .unwrap_or_else(|_| Response::new(Body::empty())))
+
+            let mut rb = client.request(method, &url).body(body_bytes);
+            for (name, value) in parts.headers.iter() {
+                let name_str = name.as_str();
+                if should_strip_request_header(name_str) {
+                    continue;
+                }
+                rb = rb.header(name, value);
             }
-        }
+
+            rb = rb.header("X-Real-IP", &client_ip);
+            rb = rb.header("X-Forwarded-For", &client_ip);
+            if crate::utils::security::transport::proxy_headers_indicate_https(&parts.headers) {
+                rb = rb.header("X-Forwarded-Proto", "https");
+            } else if let Some(proto) = parts
+                .headers
+                .get("x-forwarded-proto")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.split(',').next())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+            {
+                rb = rb.header("X-Forwarded-Proto", proto);
+            }
+            if let Some(secret) = internal_proxy_secret() {
+                rb = rb.header(INTERNAL_PROXY_HEADER, secret);
+            }
+
+            match rb.send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let headers = resp.headers().clone();
+                    let bytes = match crate::utils::http::read_response_limited(
+                        resp,
+                        crate::utils::http::MAX_PROXY_RESPONSE_BYTES,
+                    )
+                    .await
+                    {
+                        Ok(bytes) => bytes,
+                        Err(crate::utils::http::LimitedBodyError::TooLarge) => {
+                            log::error!(
+                                "HTTP proxy response too large path={path} body_bytes={body_len}"
+                            );
+                            return Ok(Response::builder()
+                                .status(http::StatusCode::BAD_GATEWAY)
+                                .header(http::header::CONTENT_TYPE, "application/json")
+                                .body(Body::from(
+                                    r#"{"error":"Bad Gateway","detail":"internal proxy"}"#,
+                                ))
+                                .unwrap_or_else(|_| Response::new(Body::empty())));
+                        }
+                        Err(_) => Vec::new(),
+                    };
+                    let mut builder = Response::builder().status(status);
+                    for (k, v) in headers.iter() {
+                        if k == http::header::TRANSFER_ENCODING {
+                            continue;
+                        }
+
+                        if is_cors_response_header(k.as_str()) {
+                            continue;
+                        }
+                        builder = builder.header(k, v);
+                    }
+                    Ok(builder
+                        .body(Body::from(bytes))
+                        .unwrap_or_else(|_| Response::new(Body::empty())))
+                }
+                Err(e) => {
+                    log::error!(
+                        "HTTP proxy to actix failed path={path} body_bytes={body_len}: {e}"
+                    );
+                    Ok(Response::builder()
+                        .status(http::StatusCode::BAD_GATEWAY)
+                        .header(http::header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            r#"{"error":"Bad Gateway","detail":"internal proxy"}"#,
+                        ))
+                        .unwrap_or_else(|_| Response::new(Body::empty())))
+                }
+            }
         };
 
         match tokio::time::timeout(HTTP_EDGE_TIMEOUT, proxy_work).await {
@@ -778,7 +741,6 @@ pub async fn run_server() -> std::io::Result<()> {
     }
 
     let app = Router::new()
-
         .route("/ws", axum::routing::any(crate::ws::ws_handler))
         .fallback(move |req: Request<Body>| {
             let c = client2.clone();
@@ -794,9 +756,7 @@ pub async fn run_server() -> std::io::Result<()> {
     let listener = match tokio::net::TcpListener::bind(("0.0.0.0", port)).await {
         Ok(listener) => listener,
         Err(err) if env::var("PORT").is_err() => {
-            log::warn!(
-                "Port {port} unavailable, falling back to an ephemeral port: {err}"
-            );
+            log::warn!("Port {port} unavailable, falling back to an ephemeral port: {err}");
             tokio::net::TcpListener::bind(("0.0.0.0", 0)).await?
         }
         Err(err) => return Err(err),

@@ -7,10 +7,11 @@
 // Przy zmianach: handlers.rs.
 
 pub mod access;
-pub mod storage;
-pub mod mentions;
+pub mod conversation_writes;
 pub mod encrypt_old;
+pub mod mentions;
 pub mod search;
+pub mod storage;
 
 use futures::stream::TryStreamExt;
 use mongodb::bson::{doc, oid::ObjectId, Bson, DateTime};
@@ -21,8 +22,8 @@ use std::collections::{HashMap, HashSet};
 use crate::model::channels::Channel;
 use crate::model::messages::Message;
 use crate::model::users::User;
-use crate::utils::channel::{can_access_channel, is_channel_admin};
 use crate::utils::access::members::require_dm_access;
+use crate::utils::channel::{can_access_channel, is_channel_admin};
 use crate::utils::user::json::resolve_display_name;
 
 pub fn dm_only_or_clause() -> Bson {
@@ -35,7 +36,10 @@ pub fn dm_only_or_clause() -> Bson {
 pub fn escape_regex(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
-        if matches!(c, '.' | '*' | '+' | '?' | '^' | '$' | '{' | '}' | '(' | ')' | '|' | '[' | ']' | '\\') {
+        if matches!(
+            c,
+            '.' | '*' | '+' | '?' | '^' | '$' | '{' | '}' | '(' | ')' | '|' | '[' | ']' | '\\'
+        ) {
             out.push('\\');
         }
         out.push(c);
@@ -88,7 +92,10 @@ fn message_content_for_api(msg: &Message, content_cache: &HashMap<ObjectId, Stri
         .unwrap_or_else(|| crate::utils::messages::storage::content_for_api(&msg.content))
 }
 
-async fn build_content_cache(msgs: &[Message], quoted: &HashMap<ObjectId, Message>) -> HashMap<ObjectId, String> {
+async fn build_content_cache(
+    msgs: &[Message],
+    quoted: &HashMap<ObjectId, Message>,
+) -> HashMap<ObjectId, String> {
     let mut pairs: Vec<(ObjectId, String)> = Vec::new();
     for m in msgs {
         if let Some(id) = m.id {
@@ -101,8 +108,7 @@ async fn build_content_cache(msgs: &[Message], quoted: &HashMap<ObjectId, Messag
         }
     }
     let contents: Vec<String> = pairs.iter().map(|(_, c)| c.clone()).collect();
-    let decrypted =
-        crate::utils::messages::storage::contents_for_api_batch_async(contents).await;
+    let decrypted = crate::utils::messages::storage::contents_for_api_batch_async(contents).await;
     pairs
         .into_iter()
         .zip(decrypted)
@@ -175,7 +181,6 @@ async fn serialize_message_inner(db: &Database, msg: &Message, include_quote: bo
 }
 
 pub async fn serialize_message(db: &Database, msg: &Message) -> Value {
-
     let mut batch = serialize_messages_batch(db, std::slice::from_ref(msg)).await;
     if let Some(value) = batch.pop() {
         return value;
@@ -211,6 +216,12 @@ fn cached_user(users: &HashMap<ObjectId, Value>, id: ObjectId) -> Value {
     users.get(&id).cloned().unwrap_or(Value::Null)
 }
 
+fn mark_users_unavailable(user_map: &mut HashMap<ObjectId, Value>, ids: &[ObjectId]) {
+    for id in ids {
+        user_map.insert(*id, json!({ "_id": id.to_hex(), "unavailable": true }));
+    }
+}
+
 enum QuotedSer<'a> {
     None,
     Present(&'a Message),
@@ -232,7 +243,11 @@ fn serialize_message_cached(
         .pinned_by
         .map(|p| cached_user(users, p))
         .unwrap_or(Value::Null);
-    let mentions: Vec<Value> = msg.mentions.iter().map(|m| cached_user(users, *m)).collect();
+    let mentions: Vec<Value> = msg
+        .mentions
+        .iter()
+        .map(|m| cached_user(users, *m))
+        .collect();
 
     let quoted = match quoted {
         QuotedSer::Present(qm) => {
@@ -295,9 +310,15 @@ pub async fn serialize_messages_batch(db: &Database, msgs: &[Message]) -> Vec<Va
                         }
                     }
                 }
-                Err(_) => quotes_unavailable = true,
+                Err(error) => {
+                    log::error!("Failed to decode quoted messages during serialization: {error}");
+                    quotes_unavailable = true;
+                }
             },
-            Err(_) => quotes_unavailable = true,
+            Err(error) => {
+                log::error!("Failed to query quoted messages during serialization: {error}");
+                quotes_unavailable = true;
+            }
         }
     }
 
@@ -312,15 +333,26 @@ pub async fn serialize_messages_batch(db: &Database, msgs: &[Message]) -> Vec<Va
     let mut user_map: HashMap<ObjectId, Value> = HashMap::new();
     if !user_ids.is_empty() {
         let ids: Vec<ObjectId> = user_ids.into_iter().collect();
-        if let Ok(cursor) = User::collection(db)
+        match User::collection(db)
             .find(doc! { "_id": { "$in": &ids } })
             .await
         {
-            let users: Vec<User> = cursor.try_collect().await.unwrap_or_default();
-            for u in users {
-                if let Some(id) = u.id {
-                    user_map.insert(id, user_to_json(&u));
+            Ok(cursor) => match cursor.try_collect::<Vec<User>>().await {
+                Ok(users) => {
+                    for user in users {
+                        if let Some(id) = user.id {
+                            user_map.insert(id, user_to_json(&user));
+                        }
+                    }
                 }
+                Err(error) => {
+                    log::error!("Failed to decode message authors during serialization: {error}");
+                    mark_users_unavailable(&mut user_map, &ids);
+                }
+            },
+            Err(error) => {
+                log::error!("Failed to query message authors during serialization: {error}");
+                mark_users_unavailable(&mut user_map, &ids);
             }
         }
     }
@@ -390,7 +422,10 @@ pub async fn try_can_pin_message(
     Ok(false)
 }
 
-pub fn dm_conversation_base_clauses(user: ObjectId, contact: ObjectId) -> Vec<mongodb::bson::Document> {
+pub fn dm_conversation_base_clauses(
+    user: ObjectId,
+    contact: ObjectId,
+) -> Vec<mongodb::bson::Document> {
     vec![
         doc! { "$or": [
             { "sender": user, "recipient": contact },
@@ -401,7 +436,11 @@ pub fn dm_conversation_base_clauses(user: ObjectId, contact: ObjectId) -> Vec<mo
     ]
 }
 
-pub fn message_belongs_to_dm_conversation(msg: &Message, user: ObjectId, contact: ObjectId) -> bool {
+pub fn message_belongs_to_dm_conversation(
+    msg: &Message,
+    user: ObjectId,
+    contact: ObjectId,
+) -> bool {
     msg.recipient.is_some()
         && msg.channel.is_none()
         && !msg.deleted

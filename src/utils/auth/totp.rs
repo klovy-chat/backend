@@ -10,8 +10,8 @@ use rand::Rng;
 use totp_rs::{Algorithm, Secret, TOTP};
 
 use crate::utils::crypto::{
-    passwords::{hash_reset_token, verify_reset_token},
     encrypt::{decrypt_field, encrypt_field},
+    passwords::{hash_reset_token, verify_reset_token},
 };
 
 pub const BACKUP_CODE_COUNT: usize = 8;
@@ -39,11 +39,7 @@ fn normalize_secret(secret: &str) -> String {
         .to_uppercase()
 }
 
-fn totp_for_account(
-    username: &str,
-    secret: &str,
-    algorithm: Algorithm,
-) -> Result<TOTP, String> {
+fn totp_for_account(username: &str, secret: &str, algorithm: Algorithm) -> Result<TOTP, String> {
     let normalized = normalize_secret(secret);
     TOTP::new(
         algorithm,

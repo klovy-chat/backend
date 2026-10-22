@@ -6,15 +6,13 @@
 // Nowe ograniczenie załącznika: tu + attachments.rs + FE.
 // Przy zmianach: ws send, upload.rs.
 
-use mongodb::bson::oid::ObjectId;
+use mongodb::bson::{doc, oid::ObjectId, DateTime};
 use mongodb::Database;
 
-use crate::model::uploads::PendingUpload;
 use crate::model::messages::Message;
 use crate::model::scan::ScanStatus;
-use crate::utils::access::members::{
-    require_channel_message_access, require_dm_access,
-};
+use crate::model::uploads::PendingUpload;
+use crate::utils::access::members::{require_channel_message_access, require_dm_access};
 use crate::utils::friends::try_are_friends;
 use crate::utils::storage::{
     attachment_path_matches_channel, attachment_path_matches_dm, attachment_stored_url_aliases,
@@ -235,9 +233,83 @@ pub async fn cleanup_attachment_if_unreferenced(
         return Ok(());
     }
 
-    let aliases = attachment_stored_url_aliases(&path, &cdn_public_base_url());
+    let claim_token = uuid::Uuid::new_v4().to_string();
+    let now = DateTime::now();
+    let lease_until = DateTime::from_millis(now.timestamp_millis() + 15 * 60 * 1000);
+    let claims = db.collection::<mongodb::bson::Document>("attachment_cleanup_claims");
+    let claim_result = claims
+        .find_one_and_update(
+            doc! {
+                "_id": &path,
+                "$or": [
+                    { "leaseUntil": { "$lte": now } },
+                    { "leaseUntil": { "$exists": false } },
+                ],
+            },
+            doc! {
+                "$set": {
+                    "token": &claim_token,
+                    "leaseUntil": lease_until,
+                },
+                "$setOnInsert": { "createdAt": now },
+            },
+        )
+        .upsert(true)
+        .return_document(mongodb::options::ReturnDocument::After)
+        .await;
+    let claim = match claim_result {
+        Ok(Some(claim)) => claim,
+        Ok(None) => {
+            return Err(format!(
+                "attachment cleanup claim was not acquired for {path}"
+            ))
+        }
+        Err(error)
+            if matches!(
+                error.kind.as_ref(),
+                mongodb::error::ErrorKind::Write(
+                    mongodb::error::WriteFailure::WriteError(write_error)
+                ) if write_error.code == 11000
+            ) =>
+        {
+            return Err(format!(
+                "attachment cleanup is already in progress for {path}"
+            ));
+        }
+        Err(error) => return Err(format!("claim attachment cleanup for {path}: {error}")),
+    };
+    if claim.get_str("token").ok() != Some(claim_token.as_str()) {
+        return Err(format!(
+            "attachment cleanup claim was not acquired for {path}"
+        ));
+    }
+
+    let cleanup_result = cleanup_claimed_attachment(db, &path).await;
+    let release_result = claims
+        .delete_one(doc! { "_id": &path, "token": &claim_token })
+        .await
+        .map_err(|error| format!("release attachment cleanup claim for {path}: {error}"))
+        .and_then(|result| {
+            if result.deleted_count == 1 {
+                Ok(())
+            } else {
+                Err(format!("attachment cleanup claim was lost for {path}"))
+            }
+        });
+    match (cleanup_result, release_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(cleanup_error), Ok(())) => Err(cleanup_error),
+        (Ok(()), Err(release_error)) => Err(release_error),
+        (Err(cleanup_error), Err(release_error)) => {
+            Err(format!("{cleanup_error}; {release_error}"))
+        }
+    }
+}
+
+async fn cleanup_claimed_attachment(db: &Database, path: &str) -> Result<(), String> {
+    let aliases = attachment_stored_url_aliases(path, &cdn_public_base_url());
     let count = Message::collection(db)
-        .count_documents(mongodb::bson::doc! {
+        .count_documents(doc! {
             "deleted": { "$ne": true },
             "fileUrl": { "$in": aliases },
         })
@@ -245,14 +317,13 @@ pub async fn cleanup_attachment_if_unreferenced(
         .map_err(|e| format!("count attachment references for {path}: {e}"))?;
 
     if count == 0 {
-        let owner = find_attachment_uploader(db, &path).await?;
+        let owner = find_attachment_uploader(db, path).await?;
         let size = storage()
-            .head_attachment_content_length(&path)
+            .head_attachment_content_length(path)
             .await
             .map_err(|e| format!("read attachment size for {path}: {e}"))?
             .unwrap_or(0);
-        let thumb_bytes = if let Some(thumb) = crate::utils::storage::attachment_thumb_key(&path)
-        {
+        let thumb_bytes = if let Some(thumb) = crate::utils::storage::attachment_thumb_key(path) {
             storage()
                 .head_attachment_content_length(&thumb)
                 .await
@@ -262,31 +333,87 @@ pub async fn cleanup_attachment_if_unreferenced(
             0
         };
 
-        storage()
-            .delete_attachment_key(&path)
-            .await
-            .map_err(|e| format!("delete attachment {path}: {e}"))?;
-
         if let Some(user_id) = owner {
             let measured = size.saturating_add(thumb_bytes);
             if measured > 0 {
-                crate::model::storage_usage::UserStorageUsage::adjust(
-                    db,
-                    user_id,
-                    -(measured as i64),
+                let measured = i64::try_from(measured)
+                    .map_err(|error| format!("attachment size is too large for {path}: {error}"))?;
+                crate::model::storage_usage::UserStorageUsage::debit_attachment_cleanup_once(
+                    db, user_id, path, measured,
                 )
                 .await
                 .map_err(|e| format!("update storage usage for {user_id}: {e}"))?;
             }
+
+            if let Err(delete_error) = storage().delete_attachment_key(path).await {
+                let remaining_size = async {
+                    let file_size = storage()
+                        .head_attachment_content_length(path)
+                        .await
+                        .map_err(|error| {
+                            format!("inspect attachment {path} after failed deletion: {error}")
+                        })?
+                        .unwrap_or(0);
+                    let thumb_size = if let Some(thumb) =
+                        crate::utils::storage::attachment_thumb_key(path)
+                    {
+                        storage()
+                            .head_attachment_content_length(&thumb)
+                            .await
+                            .map_err(|error| {
+                                format!("inspect thumbnail {thumb} after failed deletion: {error}")
+                            })?
+                            .unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    Ok::<u64, String>(file_size.saturating_add(thumb_size))
+                }
+                .await;
+                let restore_size = match remaining_size {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        log::error!(
+                            "Could not measure remaining attachment data after deletion failure: {error}"
+                        );
+                        measured
+                    }
+                };
+                let restore_size = i64::try_from(restore_size).map_err(|error| {
+                    format!("remaining attachment size is too large for {path}: {error}")
+                })?;
+                crate::model::storage_usage::UserStorageUsage::restore_attachment_cleanup(
+                    db,
+                    user_id,
+                    path,
+                    restore_size,
+                )
+                .await
+                .map_err(|restore_error| {
+                    format!(
+                        "delete attachment {path} failed: {delete_error}; failed to restore quota for {user_id}: {restore_error}"
+                    )
+                })?;
+                return Err(format!("delete attachment {path}: {delete_error}"));
+            }
+            crate::model::storage_usage::UserStorageUsage::clear_attachment_cleanup_marker(
+                db, user_id, path,
+            )
+            .await
+            .map_err(|error| {
+                format!("delete attachment {path}, but clear quota marker for {user_id}: {error}")
+            })?;
+        } else {
+            storage()
+                .delete_attachment_key(path)
+                .await
+                .map_err(|e| format!("delete attachment {path}: {e}"))?;
         }
     }
     Ok(())
 }
 
-async fn find_attachment_uploader(
-    db: &Database,
-    path: &str,
-) -> Result<Option<ObjectId>, String> {
+async fn find_attachment_uploader(db: &Database, path: &str) -> Result<Option<ObjectId>, String> {
     if let Some(pending) = PendingUpload::collection(db)
         .find_one(mongodb::bson::doc! { "filePath": path })
         .await
@@ -351,7 +478,6 @@ async fn attachment_stored_size_is_valid(
 
     if let Some(expected) = pending_size {
         if expected > 0 {
-
             if is_image {
                 if expected < actual {
                     return false;
@@ -394,7 +520,56 @@ pub async fn claim_pending_upload(user_id: &str, file_url: &Option<String>) {
         return;
     };
     let db = crate::utils::db::get_db();
-    let _ = PendingUpload::claim_by_path(&db, user_oid, &path).await;
+    if let Err(error) = PendingUpload::finalize_send_claim(&db, user_oid, &path).await {
+        log::error!("Failed to finalize pending attachment claim {path}: {error}");
+    }
+}
+
+pub async fn reserve_pending_upload(
+    user_id: &str,
+    file_url: &Option<String>,
+) -> Result<Option<String>, ()> {
+    let Some(url) = file_url else {
+        return Ok(None);
+    };
+    let Some(path) = canonicalize_message_file_url(url, &cdn_public_base_url()) else {
+        return Err(());
+    };
+    if path.is_empty() || path.starts_with("https://") {
+        return Ok(None);
+    }
+    if !is_logical_message_path(&path) {
+        return Err(());
+    }
+    let Ok(user_oid) = ObjectId::parse_str(user_id) else {
+        return Err(());
+    };
+    let db = crate::utils::db::get_db();
+    match PendingUpload::reserve_for_send(&db, user_oid, &path).await {
+        Ok(true) => Ok(Some(path)),
+        Ok(false) => {
+            log::warn!("Pending attachment is already being sent or cleaned up: {path}");
+            Err(())
+        }
+        Err(error) => {
+            log::error!("Failed to reserve pending attachment {path}: {error}");
+            Err(())
+        }
+    }
+}
+
+pub async fn release_pending_upload(user_id: &str, file_path: Option<&str>) {
+    let Some(file_path) = file_path else {
+        return;
+    };
+    let Ok(user_oid) = ObjectId::parse_str(user_id) else {
+        log::error!("Cannot release pending attachment claim for invalid user id");
+        return;
+    };
+    let db = crate::utils::db::get_db();
+    if let Err(error) = PendingUpload::release_send_claim(&db, user_oid, file_path).await {
+        log::error!("Failed to release pending attachment claim {file_path}: {error}");
+    }
 }
 
 pub async fn validate_message_attachment(
@@ -407,11 +582,13 @@ pub async fn validate_message_attachment(
     let canonical = match file_url {
         None => return Ok(None),
         Some(url) if url.trim().is_empty() => return Ok(None),
-        Some(url) => canonicalize_message_file_url(url, &cdn_public_base_url()).ok_or_else(|| {
-            log::warn!(
+        Some(url) => {
+            canonicalize_message_file_url(url, &cdn_public_base_url()).ok_or_else(|| {
+                log::warn!(
                 "attachment rejected INVALID_FILE reason=canonical user={user_id} file={file_url:?}"
             );
-        })?,
+            })?
+        }
     };
     if canonical.is_empty() {
         return Ok(None);
@@ -549,9 +726,7 @@ mod tests {
     fn quarantine_prefix_is_rejected() {
         let cdn = "https://cdn.klovy.chat";
         assert!(canonicalize_message_file_url(&format!("quarantine/{KEY}"), cdn).is_none());
-        assert!(
-            canonicalize_message_file_url(&format!("{cdn}/quarantine/{KEY}"), cdn).is_none()
-        );
+        assert!(canonicalize_message_file_url(&format!("{cdn}/quarantine/{KEY}"), cdn).is_none());
     }
 
     #[test]
@@ -589,8 +764,9 @@ mod tests {
             canonicalize_message_file_url(&format!("{cdn}/{KEY}"), cdn).as_deref(),
             Some(KEY)
         );
-        assert!(crate::utils::validators::url::is_allowed_external_media_url(
-            &format!("{cdn}/{KEY}")
-        ) == false);
+        assert!(
+            crate::utils::validators::url::is_allowed_external_media_url(&format!("{cdn}/{KEY}"))
+                == false
+        );
     }
 }

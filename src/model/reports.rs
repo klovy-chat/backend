@@ -78,9 +78,9 @@ pub enum ChannelReportValidationError {
 impl std::fmt::Display for ChannelReportValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let msg = match self {
-            Self::ReasonRequired  => "Powód jest wymagany",
-            Self::ReasonTooLong   => "Powód nie może przekraczać 200 znaków",
-            Self::DetailsTooLong  => "Opis nie może przekraczać 2000 znaków",
+            Self::ReasonRequired => "Powód jest wymagany",
+            Self::ReasonTooLong => "Powód nie może przekraczać 200 znaków",
+            Self::DetailsTooLong => "Opis nie może przekraczać 2000 znaków",
         };
         write!(f, "{}", msg)
     }
@@ -113,17 +113,18 @@ impl ChannelReport {
     pub async fn create_indexes(db: &Database) -> mongodb::error::Result<()> {
         let col = Self::collection(db);
 
-        col.create_index(
-            IndexModel::builder().keys(doc! { "channelId": 1 }).build(),
-        ).await?;
+        col.create_index(IndexModel::builder().keys(doc! { "channelId": 1 }).build())
+            .await?;
+
+        col.create_index(IndexModel::builder().keys(doc! { "status": 1 }).build())
+            .await?;
 
         col.create_index(
-            IndexModel::builder().keys(doc! { "status": 1 }).build(),
-        ).await?;
-
-        col.create_index(
-            IndexModel::builder().keys(doc! { "status": 1, "createdAt": -1 }).build(),
-        ).await?;
+            IndexModel::builder()
+                .keys(doc! { "status": 1, "createdAt": -1 })
+                .build(),
+        )
+        .await?;
 
         Ok(())
     }
@@ -141,7 +142,10 @@ impl ChannelReport {
             reported_by: input.reported_by,
             reporter_username: input.reporter_username.trim().to_string(),
             reason: input.reason.trim().to_string(),
-            details: input.details.map(|d| d.trim().to_string()).filter(|d| !d.is_empty()),
+            details: input
+                .details
+                .map(|d| d.trim().to_string())
+                .filter(|d| !d.is_empty()),
             status: ChannelReportStatus::Pending,
             created_at: DateTime::now(),
             reviewed_at: None,

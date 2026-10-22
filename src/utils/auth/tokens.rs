@@ -32,7 +32,8 @@ pub async fn create_access_token(
         Err(_) => 0,
     };
 
-    let key = std::env::var("JWT_KEY").map_err(|_| "JWT_KEY is not defined in environment variables")?;
+    let key =
+        std::env::var("JWT_KEY").map_err(|_| "JWT_KEY is not defined in environment variables")?;
     let exp = (chrono::Utc::now().timestamp() + ACCESS_MAX_AGE_MS / 1000) as usize;
 
     let claims = TokenPayload {

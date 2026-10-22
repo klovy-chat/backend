@@ -12,7 +12,6 @@ use actix_web::http::Method;
 use http::HeaderMap;
 
 fn normalize_origin(origin: &str) -> String {
-
     origin.trim().trim_end_matches('/').to_string()
 }
 
@@ -64,9 +63,7 @@ pub fn origin_allowed(value: &str, allowed: &[String]) -> bool {
         .any(|origin| value == origin || value.starts_with(&format!("{origin}/")))
 }
 
-use crate::utils::security::id::{
-    canonicalize_request_path, is_security_webhook_path,
-};
+use crate::utils::security::id::{canonicalize_request_path, is_security_webhook_path};
 
 pub fn is_origin_guard_exempt(path: &str) -> bool {
     let path = canonicalize_request_path(path);
@@ -86,7 +83,6 @@ pub fn requires_origin_guard(method: &Method, path: &str) -> bool {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OriginGuardMode {
-
     Strict,
 
     RejectKnownBad,
@@ -97,12 +93,8 @@ pub fn validate_browser_origin(
     allowed: &[String],
     mode: OriginGuardMode,
 ) -> bool {
-    let origin = headers
-        .get("origin")
-        .and_then(|v| v.to_str().ok());
-    let referer = headers
-        .get("referer")
-        .and_then(|v| v.to_str().ok());
+    let origin = headers.get("origin").and_then(|v| v.to_str().ok());
+    let referer = headers.get("referer").and_then(|v| v.to_str().ok());
     validate_browser_origin_values(origin, referer, allowed, mode)
 }
 

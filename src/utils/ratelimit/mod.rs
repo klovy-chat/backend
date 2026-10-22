@@ -86,11 +86,34 @@ impl Store {
     }
 
     pub fn check_and_increment_with_window(&self, key: &str, max: u32, window: Duration) -> bool {
-        if self.would_block_with_window(key, max, window) {
-            return false;
+        self.reserve_with_window(key, max, window).is_some()
+    }
+
+    fn reserve_with_window(&self, key: &str, max: u32, window: Duration) -> Option<Instant> {
+        let mut map = self.lock_buckets();
+        let now = Instant::now();
+        let bucket = map.entry(key.to_string()).or_insert(Bucket {
+            count: 0,
+            reset: now + window,
+        });
+        if now >= bucket.reset {
+            bucket.count = 0;
+            bucket.reset = now + window;
         }
-        self.increment_with_window(key, window);
-        true
+        if bucket.count >= max {
+            return None;
+        }
+        bucket.count = bucket.count.saturating_add(1);
+        Some(bucket.reset)
+    }
+
+    fn release_reservation(&self, key: &str, reset: Instant) {
+        let mut map = self.lock_buckets();
+        if let Some(bucket) = map.get_mut(key) {
+            if bucket.reset == reset && bucket.count > 0 {
+                bucket.count -= 1;
+            }
+        }
     }
 
     pub fn would_block_with_window(&self, key: &str, max: u32, window: Duration) -> bool {
@@ -208,14 +231,20 @@ async fn limit_failures(
     let ip = client_ip(&req);
     let key = rate_limit_key(prefix, &ip);
 
-    if store.is_over_limit(&key) {
+    let Some(reservation_reset) = store.reserve_with_window(&key, store.max, store.window) else {
         let (req, _) = req.into_parts();
         return Ok(ServiceResponse::new(req, too_many(error, retry_after)).map_into_right_body());
-    }
+    };
 
-    let res = next.call(req).await?;
-    if res.status().as_u16() >= 400 {
-        store.increment(&key);
+    let res = match next.call(req).await {
+        Ok(res) => res,
+        Err(error) => {
+            store.release_reservation(&key, reservation_reset);
+            return Err(error);
+        }
+    };
+    if res.status().as_u16() < 400 {
+        store.release_reservation(&key, reservation_reset);
     }
     Ok(res.map_into_left_body())
 }
@@ -244,7 +273,8 @@ static UPLOAD: Lazy<Store> = Lazy::new(|| Store::new(60, Duration::from_secs(60)
 static INVITE_ACCEPT: Lazy<Store> = Lazy::new(|| Store::new(15, Duration::from_secs(15 * 60)));
 static FRIEND_REQUEST: Lazy<Store> = Lazy::new(|| Store::new(40, Duration::from_secs(60 * 60)));
 static CHANNEL_REPORT: Lazy<Store> = Lazy::new(|| Store::new(10, Duration::from_secs(15 * 60)));
-static TWO_FACTOR_MUTATION: Lazy<Store> = Lazy::new(|| Store::new(10, Duration::from_secs(15 * 60)));
+static TWO_FACTOR_MUTATION: Lazy<Store> =
+    Lazy::new(|| Store::new(10, Duration::from_secs(15 * 60)));
 static INVITE_PREVIEW: Lazy<Store> = Lazy::new(|| Store::new(60, Duration::from_secs(15 * 60)));
 static WS_HANDSHAKE: Lazy<Store> = Lazy::new(|| Store::new(60, Duration::from_secs(60)));
 static CHANGE_PASSWORD: Lazy<Store> = Lazy::new(|| Store::new(5, Duration::from_secs(15 * 60)));
@@ -265,6 +295,51 @@ static CHAT_ATTACHMENT: Lazy<Store> = Lazy::new(|| {
         crate::utils::upload::chat_attachment_window(),
     )
 });
+
+#[cfg(test)]
+mod tests {
+    use super::Store;
+    use std::sync::{Arc, Barrier};
+    use std::time::Duration;
+
+    #[test]
+    fn failure_reservations_enforce_limit_atomically() {
+        let store = Arc::new(Store::new(8, Duration::from_secs(60)));
+        let barrier = Arc::new(Barrier::new(32));
+        let workers: Vec<_> = (0..32)
+            .map(|_| {
+                let store = Arc::clone(&store);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store.reserve_with_window("login:test", 8, Duration::from_secs(60))
+                })
+            })
+            .collect();
+
+        let admitted = workers
+            .into_iter()
+            .filter_map(|worker| worker.join().expect("rate-limit worker panicked"))
+            .count();
+        assert_eq!(admitted, 8);
+    }
+
+    #[test]
+    fn successful_request_releases_only_its_reservation() {
+        let store = Store::new(1, Duration::from_secs(60));
+        let reservation = store
+            .reserve_with_window("login:test", 1, Duration::from_secs(60))
+            .expect("first request should reserve a slot");
+        assert!(store
+            .reserve_with_window("login:test", 1, Duration::from_secs(60))
+            .is_none());
+
+        store.release_reservation("login:test", reservation);
+        assert!(store
+            .reserve_with_window("login:test", 1, Duration::from_secs(60))
+            .is_some());
+    }
+}
 
 fn chat_attachment_key(user_id: &str) -> String {
     rate_limit_key("chat-attachment", user_id)
@@ -397,11 +472,8 @@ pub async fn upload_limiter(
     if !UPLOAD.check_and_increment(&ip_key) {
         let (req, _) = req.into_parts();
         return Ok(
-            ServiceResponse::new(
-                req,
-                too_many("Too many file uploads. Slow down.", 60),
-            )
-            .map_into_boxed_body(),
+            ServiceResponse::new(req, too_many("Too many file uploads. Slow down.", 60))
+                .map_into_boxed_body(),
         );
     }
 
@@ -413,13 +485,11 @@ pub async fn upload_limiter(
         let user_key = rate_limit_key("upload-user", &user_id);
         if !UPLOAD.check_and_increment(&user_key) {
             let (req, _) = req.into_parts();
-            return Ok(
-                ServiceResponse::new(
-                    req,
-                    too_many("Too many file uploads. Slow down.", 60),
-                )
-                .map_into_boxed_body(),
-            );
+            return Ok(ServiceResponse::new(
+                req,
+                too_many("Too many file uploads. Slow down.", 60),
+            )
+            .map_into_boxed_body());
         }
     }
 
@@ -434,16 +504,14 @@ pub async fn invite_accept_limiter(
     let key = rate_limit_key("invite-accept", &ip);
     if !INVITE_ACCEPT.check_and_increment(&key) {
         let (req, _) = req.into_parts();
-        return Ok(
-            ServiceResponse::new(
-                req,
-                too_many(
-                    "Too many invite accept attempts. Try again later.",
-                    15 * 60 * 1000,
-                ),
-            )
-            .map_into_boxed_body(),
-        );
+        return Ok(ServiceResponse::new(
+            req,
+            too_many(
+                "Too many invite accept attempts. Try again later.",
+                15 * 60 * 1000,
+            ),
+        )
+        .map_into_boxed_body());
     }
     Ok(next.call(req).await?.map_into_boxed_body())
 }

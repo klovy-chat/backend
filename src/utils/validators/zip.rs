@@ -22,11 +22,7 @@ const PDF_EOF_SCAN_BYTES: u64 = 4096;
 
 const MAX_PDF_OBJECT_MARKERS: usize = 5_000;
 
-const PDF_DANGEROUS_PATTERNS: &[&[u8]] = &[
-    b"/JavaScript",
-    b"/Launch",
-    b"/OpenAction",
-];
+const PDF_DANGEROUS_PATTERNS: &[&[u8]] = &[b"/JavaScript", b"/Launch", b"/OpenAction"];
 
 pub fn validate_upload_document(path: &Path, ext: &str) -> bool {
     match ext.to_ascii_lowercase().as_str() {

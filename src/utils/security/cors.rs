@@ -8,9 +8,9 @@
 
 use http::header::HeaderName;
 
+use super::csrf::CSRF_HEADER_NAME;
 use super::id::CLIENT_HEADER_NAME;
 use super::user_agent::CLIENT_USER_AGENT_HEADER;
-use super::csrf::CSRF_HEADER_NAME;
 
 pub const CORS_ALLOWED_REQUEST_HEADERS: [HeaderName; 10] = [
     HeaderName::from_static("content-type"),

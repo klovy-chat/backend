@@ -19,6 +19,14 @@ path = "src/main.rs"
 name = "encrypt-old-messages"
 path = "src/bin/encrypt_old_messages.rs"
 
+[[bin]]
+name = "migrate-storage-usage"
+path = "src/bin/migrate_storage_usage.rs"
+
+[[bin]]
+name = "migrate-friend-request-pairs"
+path = "src/bin/migrate_friend_request_pairs.rs"
+
 [dependencies]
 actix-web = "4"
 actix-multipart = "0.7"

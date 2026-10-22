@@ -8,8 +8,8 @@
 
 use std::env;
 
-use crate::utils::env::{is_production, node_env};
 use crate::utils::auth::jwt::jwt_secret;
+use crate::utils::env::{is_production, node_env};
 use crate::utils::registration::{
     is_registration_disabled, signup_max_global_per_day, signup_max_global_per_hour,
     signup_max_per_ip_hour,
@@ -29,9 +29,7 @@ fn validate_r2_env() {
         "CDN_PUBLIC_BASE_URL",
     ] {
         if env::var(var).map(|v| v.trim().is_empty()).unwrap_or(true) {
-            panic!(
-                "{var} must be set — uploads use Cloudflare R2 (see backend/docs/R2_SETUP.md)"
-            );
+            panic!("{var} must be set — uploads use Cloudflare R2 (see backend/docs/R2_SETUP.md)");
         }
     }
 
@@ -93,9 +91,7 @@ fn validate_livekit_env() {
 pub fn validate_startup_config() {
     let origin = env::var("ORIGIN").unwrap_or_default();
     if origin_looks_like_production(&origin) && !is_production() {
-        panic!(
-            "NODE_ENV must be \"production\" when ORIGIN is set to a public URL ({origin})"
-        );
+        panic!("NODE_ENV must be \"production\" when ORIGIN is set to a public URL ({origin})");
     }
 
     if is_production() {
@@ -135,7 +131,9 @@ pub fn validate_startup_config() {
 
         let mongo_uri = crate::utils::db_url::database_url().unwrap_or_default();
         if mongo_uri.trim().is_empty() {
-            panic!("Database URL must be set in production (DATABASE_URL, MONGODB_URI, or MONGO_URI)");
+            panic!(
+                "Database URL must be set in production (DATABASE_URL, MONGODB_URI, or MONGO_URI)"
+            );
         }
 
         if !env::var("TRUST_PROXY")
@@ -184,9 +182,7 @@ pub fn validate_startup_config() {
 
         let internal_proxy_secret = env::var("INTERNAL_PROXY_SECRET").unwrap_or_default();
         if internal_proxy_secret.trim().len() < 32 {
-            panic!(
-                "INTERNAL_PROXY_SECRET must be at least 32 characters in production"
-            );
+            panic!("INTERNAL_PROXY_SECRET must be at least 32 characters in production");
         }
 
         let frontend_url = env::var("FRONTEND_URL").unwrap_or_default();

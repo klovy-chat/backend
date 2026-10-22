@@ -19,39 +19,39 @@ use crate::model::messages::{
 };
 use crate::model::scan::ScanStatus;
 use crate::model::users::User;
-use crate::ws::registry;
-use crate::ws::state::{is_valid_object_id, now_ms, SocketState};
-use crate::ws::typing::{self, TypingAccess};
 use crate::utils::access::members::{
     channel_admin_bypasses_slowmode, require_channel_access, require_channel_message_access,
     require_dm_access, require_message_participant, AccessDeniedReason,
 };
-use crate::utils::ratelimit::slowmode::{check_channel_slowmode, record_channel_slowmode};
+use crate::utils::channel::{can_access_channel, is_channel_admin};
 use crate::utils::db::get_db;
 use crate::utils::friends::try_is_dm_blocked;
-use crate::utils::channel::{can_access_channel, is_channel_admin};
+use crate::utils::messages::access::{
+    claim_pending_upload, cleanup_attachment_if_unreferenced, release_pending_upload,
+    reserve_pending_upload, scan_status_for_attachment, try_can_mark_message_as_read,
+    validate_message_attachment, validate_quote_target_with_access, AttachmentSendContext,
+    QuoteContext,
+};
+use crate::utils::messages::mentions::{has_everyone_mention, resolve_mentions};
+use crate::utils::messages::storage::inbound_plaintext_for_processing;
+use crate::utils::messages::{dm_only_or_clause, serialize_message};
+use crate::utils::ratelimit::slowmode::{check_channel_slowmode, record_channel_slowmode};
+use crate::utils::scan::{enqueue, ScanJob};
+use crate::utils::unread::{
+    emit_unread_absolute, emit_unread_delta_at, mark_channel_as_read_for_user,
+    peek_unread_generation,
+};
 use crate::utils::voice::calls::{
-    accept_session, cancel_session, create_ringing_session, drain_expired_sessions,
-    end_session, reject_session, restore_sessions, ringing_sessions_for_callee,
-    take_sessions_for_user, CallPhase, CallSession, CallSessionError,
+    accept_session, cancel_session, create_ringing_session, drain_expired_sessions, end_session,
+    reject_session, restore_sessions, ringing_sessions_for_callee, take_sessions_for_user,
+    CallPhase, CallSession, CallSessionError,
 };
 use crate::utils::voice::channels::{
     clear_user_from_all_channels, join_channel_voice, leave_channel_voice, participants_in_channel,
 };
-use crate::utils::messages::access::{
-    claim_pending_upload, try_can_mark_message_as_read,
-    cleanup_attachment_if_unreferenced, scan_status_for_attachment, validate_message_attachment,
-    AttachmentSendContext, QuoteContext, validate_quote_target_with_access,
-};
-use crate::utils::scan::{enqueue, ScanJob};
-use crate::utils::messages::mentions::{has_everyone_mention, resolve_mentions};
-use crate::utils::messages::{dm_only_or_clause, serialize_message};
-use crate::utils::messages::storage::inbound_plaintext_for_processing;
-use crate::utils::unread::{
-    emit_unread_absolute,
-    emit_unread_delta_at, peek_unread_generation,
-    mark_channel_as_read_for_user,
-};
+use crate::ws::registry;
+use crate::ws::state::{is_valid_object_id, now_ms, SocketState};
+use crate::ws::typing::{self, TypingAccess};
 
 async fn message_still_active(db: &Database, id: ObjectId) -> Option<bool> {
     match Message::collection(db)
@@ -86,7 +86,11 @@ fn reactions_json(msg: &Message) -> Value {
     for (emoji, reaction) in &msg.reactions {
         map.insert(
             emoji.clone(),
-            json!(reaction.users.iter().map(|u| u.to_hex()).collect::<Vec<_>>()),
+            json!(reaction
+                .users
+                .iter()
+                .map(|u| u.to_hex())
+                .collect::<Vec<_>>()),
         );
     }
     Value::Object(map)
@@ -114,12 +118,7 @@ async fn set_user_offline(user_id: &str) -> bool {
     };
     let now = DateTime::now();
     matches!(
-        User::set_fields(
-            &get_db(),
-            oid,
-            doc! { "isOnline": false, "lastSeen": now },
-        )
-        .await,
+        User::set_fields(&get_db(), oid, doc! { "isOnline": false, "lastSeen": now },).await,
         Ok(Some(_))
     )
 }
@@ -250,21 +249,21 @@ async fn handle_send_message(connected: &str, payload: SendMessagePayload) {
     {
         Ok(url) => url,
         Err(()) => {
-        log::warn!(
-            "sendMessage rejected INVALID_FILE sender={} file={:?}",
-            payload.sender,
-            payload.file_url
-        );
-        registry::emit_to_user(
-            &payload.sender,
-            "dm-error",
-            json!({
-                "code": "INVALID_FILE",
-                "message": "Nie można dołączyć tego pliku do wiadomości.",
-                "clientNonce": payload.client_nonce,
-            }),
-        );
-        return;
+            log::warn!(
+                "sendMessage rejected INVALID_FILE sender={} file={:?}",
+                payload.sender,
+                payload.file_url
+            );
+            registry::emit_to_user(
+                &payload.sender,
+                "dm-error",
+                json!({
+                    "code": "INVALID_FILE",
+                    "message": "Nie można dołączyć tego pliku do wiadomości.",
+                    "clientNonce": payload.client_nonce,
+                }),
+            );
+            return;
         }
     };
 
@@ -349,11 +348,54 @@ async fn handle_send_message(connected: &str, payload: SendMessagePayload) {
     };
 
     let unread_gen = peek_unread_generation(&payload.recipient, "dm", &payload.sender);
+    let dm_write_guard = match crate::utils::messages::conversation_writes::reserve_message_write(
+        &db, sender, recipient,
+    )
+    .await
+    {
+        Ok(Some(guard)) => guard,
+        Ok(None) => {
+            registry::emit_to_user(
+                &payload.sender,
+                "dm-error",
+                json!({
+                    "code": "CONVERSATION_DELETING",
+                    "message": "Nie można wysłać wiadomości podczas usuwania konwersacji.",
+                    "clientNonce": payload.client_nonce,
+                    "retryable": true,
+                }),
+            );
+            return;
+        }
+        Err(error) => {
+            log::error!("Failed to reserve DM conversation write: {error}");
+            emit_send_error(
+                connected,
+                "SEND_FAILED",
+                "Nie udało się wysłać wiadomości. Spróbuj ponownie.",
+                payload.client_nonce.as_deref(),
+            );
+            return;
+        }
+    };
+    let reserved_upload = match reserve_pending_upload(&payload.sender, &file_url).await {
+        Ok(path) => path,
+        Err(()) => {
+            emit_send_error(
+                connected,
+                "INVALID_FILE",
+                "Nie udało się wysłać załącznika. Spróbuj ponownie.",
+                payload.client_nonce.as_deref(),
+            );
+            return;
+        }
+    };
 
     let (created, is_replay) = match Message::create(&db, input).await {
         Ok(CreateMessageOutcome::Created(m)) => (m, false),
         Ok(CreateMessageOutcome::IdempotentReplay(m)) => (m, true),
         Err(CreateMessageError::NonceConflict) => {
+            release_pending_upload(&payload.sender, reserved_upload.as_deref()).await;
             emit_send_error(
                 connected,
                 "NONCE_CONFLICT",
@@ -363,6 +405,7 @@ async fn handle_send_message(connected: &str, payload: SendMessagePayload) {
             return;
         }
         Err(e) => {
+            release_pending_upload(&payload.sender, reserved_upload.as_deref()).await;
             log::error!("sendMessage create error: {}", e);
             emit_send_error(
                 connected,
@@ -374,7 +417,15 @@ async fn handle_send_message(connected: &str, payload: SendMessagePayload) {
         }
     };
 
-    claim_pending_upload(&payload.sender, &file_url).await;
+    if let Err(error) = dm_write_guard.release().await {
+        log::error!("Failed to release DM conversation write guard: {error}");
+    }
+
+    if is_replay {
+        release_pending_upload(&payload.sender, reserved_upload.as_deref()).await;
+    } else {
+        claim_pending_upload(&payload.sender, &file_url).await;
+    }
 
     if created.scan_status == ScanStatus::Pending {
         if let Some(path) = created.file_url.clone() {
@@ -403,10 +454,9 @@ async fn handle_send_message(connected: &str, payload: SendMessagePayload) {
         tokio::spawn(async move {
             crate::utils::tips::upsert_dm_tip(&db_tip, &tip_msg).await;
             if bump {
-                if let Some(n) = crate::utils::tips::try_sync_dm_tip_unread(
-                    &db_tip, recipient_oid, sender_oid,
-                )
-                .await
+                if let Some(n) =
+                    crate::utils::tips::try_sync_dm_tip_unread(&db_tip, recipient_oid, sender_oid)
+                        .await
                 {
                     emit_unread_absolute(&recipient_id, "dm", &sender_id, n);
                 }
@@ -415,32 +465,26 @@ async fn handle_send_message(connected: &str, payload: SendMessagePayload) {
         return;
     }
 
-    let (populated, muted_lookup) = tokio::join!(
-        serialize_message(&db, &created),
-        async {
-            use mongodb::bson::Document;
-            let coll = db.collection::<Document>("users");
-            match coll
-                .find_one(doc! { "_id": recipient })
-                .projection(doc! { "mutedContacts": 1 })
-                .await
-            {
-                Ok(Some(doc)) => Ok(doc
-                    .get_array("mutedContacts")
-                    .ok()
-                    .map(|arr| {
-                        arr.iter().any(|b| {
-                            b.as_object_id()
-                                .map(|id| id == sender)
-                                .unwrap_or(false)
-                        })
-                    })
-                    .unwrap_or(false)),
-                Ok(None) => Err(()),
-                Err(_) => Err(()),
-            }
-        },
-    );
+    let (populated, muted_lookup) = tokio::join!(serialize_message(&db, &created), async {
+        use mongodb::bson::Document;
+        let coll = db.collection::<Document>("users");
+        match coll
+            .find_one(doc! { "_id": recipient })
+            .projection(doc! { "mutedContacts": 1 })
+            .await
+        {
+            Ok(Some(doc)) => Ok(doc
+                .get_array("mutedContacts")
+                .ok()
+                .map(|arr| {
+                    arr.iter()
+                        .any(|b| b.as_object_id().map(|id| id == sender).unwrap_or(false))
+                })
+                .unwrap_or(false)),
+            Ok(None) => Err(()),
+            Err(_) => Err(()),
+        }
+    },);
     let muted_lookup_ok = muted_lookup.is_ok();
     let recipient_muted = muted_lookup.unwrap_or(true);
 
@@ -465,14 +509,15 @@ async fn handle_send_message(connected: &str, payload: SendMessagePayload) {
         tokio::spawn(async move {
             crate::utils::tips::upsert_dm_tip(&db_tip, &tip_msg).await;
             if bump {
-
                 let still_active = match tip_mid {
                     Some(id) => message_still_active(&db_tip, id).await,
                     None => Some(false),
                 };
                 if still_active == Some(false) {
                     if let Some(n) = crate::utils::tips::try_sync_dm_tip_unread(
-                        &db_tip, recipient_oid, sender_oid,
+                        &db_tip,
+                        recipient_oid,
+                        sender_oid,
                     )
                     .await
                     {
@@ -486,12 +531,9 @@ async fn handle_send_message(connected: &str, payload: SendMessagePayload) {
                 } else if peek_unread_generation(&recipient_id_tip, "dm", &sender_id_tip)
                     == unread_gen_tip
                 {
-                    let bumped = crate::utils::tips::bump_dm_unread(
-                        &db_tip,
-                        sender_oid,
-                        recipient_oid,
-                    )
-                    .await;
+                    let bumped =
+                        crate::utils::tips::bump_dm_unread(&db_tip, sender_oid, recipient_oid)
+                            .await;
                     let still_active = match tip_mid {
                         Some(id) => message_still_active(&db_tip, id).await,
                         None => Some(false),
@@ -509,7 +551,9 @@ async fn handle_send_message(connected: &str, payload: SendMessagePayload) {
                             unread_gen_tip,
                         );
                     } else if let Some(n) = crate::utils::tips::try_sync_dm_tip_unread(
-                        &db_tip, recipient_oid, sender_oid,
+                        &db_tip,
+                        recipient_oid,
+                        sender_oid,
                     )
                     .await
                     {
@@ -520,10 +564,9 @@ async fn handle_send_message(connected: &str, payload: SendMessagePayload) {
                             n,
                         );
                     }
-                } else if let Some(n) = crate::utils::tips::try_sync_dm_tip_unread(
-                    &db_tip, recipient_oid, sender_oid,
-                )
-                .await
+                } else if let Some(n) =
+                    crate::utils::tips::try_sync_dm_tip_unread(&db_tip, recipient_oid, sender_oid)
+                        .await
                 {
                     crate::utils::unread::emit_unread_absolute(
                         &recipient_id_tip,
@@ -570,19 +613,19 @@ async fn handle_send_channel_message(connected: &str, payload: ChannelMessagePay
         return;
     }
 
-    let channel = match require_channel_message_access(&db, &payload.channel_id, &payload.sender).await
-    {
-        Ok(channel) => channel,
-        Err(reason) => {
-            emit_send_error(
-                connected,
-                "FORBIDDEN",
-                reason.as_str(),
-                payload.client_nonce.as_deref(),
-            );
-            return;
-        }
-    };
+    let channel =
+        match require_channel_message_access(&db, &payload.channel_id, &payload.sender).await {
+            Ok(channel) => channel,
+            Err(reason) => {
+                emit_send_error(
+                    connected,
+                    "FORBIDDEN",
+                    reason.as_str(),
+                    payload.client_nonce.as_deref(),
+                );
+                return;
+            }
+        };
 
     let bypass = channel_admin_bypasses_slowmode(&channel, &payload.sender);
     if crate::utils::channel::is_channel_chat_locked_for_sender(&channel, &payload.sender) {
@@ -634,18 +677,18 @@ async fn handle_send_channel_message(connected: &str, payload: ChannelMessagePay
     {
         Ok(url) => url,
         Err(()) => {
-        log::warn!(
-            "channel message rejected INVALID_FILE sender={} file={:?}",
-            payload.sender,
-            payload.file_url
-        );
-        emit_send_error(
-            connected,
-            "INVALID_FILE",
-            "Nie udało się wysłać załącznika. Spróbuj ponownie.",
-            payload.client_nonce.as_deref(),
-        );
-        return;
+            log::warn!(
+                "channel message rejected INVALID_FILE sender={} file={:?}",
+                payload.sender,
+                payload.file_url
+            );
+            emit_send_error(
+                connected,
+                "INVALID_FILE",
+                "Nie udało się wysłać załącznika. Spróbuj ponownie.",
+                payload.client_nonce.as_deref(),
+            );
+            return;
         }
     };
 
@@ -707,12 +750,7 @@ async fn handle_send_channel_message(connected: &str, payload: ChannelMessagePay
     .await
     {
         Ok(ChannelBroadcastOutcome::Created(_)) => {
-            record_channel_slowmode(
-                &payload.sender,
-                &payload.channel_id,
-                rate_limit,
-                bypass_sm,
-            );
+            record_channel_slowmode(&payload.sender, &payload.channel_id, rate_limit, bypass_sm);
         }
         Ok(ChannelBroadcastOutcome::IdempotentReplay(_)) => {}
         Err(CreateMessageError::NonceConflict) => {
@@ -796,6 +834,33 @@ pub async fn create_and_broadcast_channel_message(
         is_channel_admin(&channel, Some(&sender_hex)) && has_everyone_mention(&prepared_content);
 
     let scan_status = scan_status_for_attachment(db, &sender_hex, &file_url).await;
+    let write_token = uuid::Uuid::new_v4().to_string();
+    match Channel::reserve_message_write(db, channel_oid, &write_token).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(CreateMessageError::Other(
+                "channel deletion is in progress".into(),
+            ));
+        }
+        Err(error) => {
+            log::error!("Failed to reserve channel message write: {error}");
+            return Err(CreateMessageError::Other(
+                "failed to reserve channel message write".into(),
+            ));
+        }
+    }
+    let reserved_upload = match reserve_pending_upload(&sender_hex, &file_url).await {
+        Ok(path) => path,
+        Err(()) => {
+            if let Err(error) = Channel::release_message_write(db, channel_oid, &write_token).await
+            {
+                log::error!("Failed to release channel message write: {error}");
+            }
+            return Err(CreateMessageError::Other(
+                "pending attachment is unavailable".into(),
+            ));
+        }
+    };
     let create_input = CreateMessageInput {
         sender,
         recipient: None,
@@ -826,16 +891,74 @@ pub async fn create_and_broadcast_channel_message(
         })
         .collect();
 
-    let (created, is_replay) = match Message::create(db, create_input).await {
-        Ok(CreateMessageOutcome::Created(m)) => (m, false),
-        Ok(CreateMessageOutcome::IdempotentReplay(m)) => (m, true),
-        Err(e) => {
+    let heartbeat_db = db.clone();
+    let heartbeat_token = write_token.clone();
+    let (heartbeat_failed_tx, mut heartbeat_failed_rx) = tokio::sync::oneshot::channel();
+    let heartbeat = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                Channel::renew_message_write(&heartbeat_db, channel_oid, &heartbeat_token),
+            )
+            .await
+            {
+                Ok(Ok(true)) => {}
+                Ok(Ok(false)) => {
+                    let _ = heartbeat_failed_tx.send(());
+                    break;
+                }
+                Ok(Err(error)) => {
+                    log::error!("Failed to renew channel message write lease: {error}");
+                    let _ = heartbeat_failed_tx.send(());
+                    break;
+                }
+                Err(_) => {
+                    log::error!("Timed out renewing channel message write lease");
+                    let _ = heartbeat_failed_tx.send(());
+                    break;
+                }
+            }
+        }
+    });
+    let create_result = tokio::select! {
+        result = Message::create(db, create_input) => Some(result),
+        _ = &mut heartbeat_failed_rx => None,
+    };
+    heartbeat.abort();
+
+    let (created, is_replay) = match create_result {
+        Some(Ok(CreateMessageOutcome::Created(m))) => (m, false),
+        Some(Ok(CreateMessageOutcome::IdempotentReplay(m))) => (m, true),
+        Some(Err(e)) => {
+            release_pending_upload(&sender_hex, reserved_upload.as_deref()).await;
+            if let Err(error) = Channel::release_message_write(db, channel_oid, &write_token).await
+            {
+                log::error!("Failed to release channel message write after error: {error}");
+            }
             log::error!("create_and_broadcast_channel_message error: {}", e);
             return Err(e);
         }
+        None => {
+            release_pending_upload(&sender_hex, reserved_upload.as_deref()).await;
+            log::warn!(
+                "Keeping channel message write reservation for channel {} until expiry after heartbeat failure",
+                channel_oid.to_hex()
+            );
+            return Err(CreateMessageError::Other(
+                "channel message write lease expired".into(),
+            ));
+        }
     };
+    if let Err(error) = Channel::release_message_write(db, channel_oid, &write_token).await {
+        log::error!("Failed to release channel message write after creation: {error}");
+    }
 
-    claim_pending_upload(&sender_hex, &created.file_url).await;
+    if is_replay {
+        release_pending_upload(&sender_hex, reserved_upload.as_deref()).await;
+    } else {
+        claim_pending_upload(&sender_hex, &created.file_url).await;
+    }
 
     if created.scan_status == ScanStatus::Pending {
         if let Some(path) = created.file_url.clone() {
@@ -879,10 +1002,7 @@ pub async fn create_and_broadcast_channel_message(
         let channel_id_heal = channel_id_str.clone();
         let unread_targets_heal = unread_targets.clone();
         tokio::spawn(async move {
-            crate::utils::tips::upsert_channel_tip(
-                &db_tip, channel_oid, &tip_msg,
-            )
-            .await;
+            crate::utils::tips::upsert_channel_tip(&db_tip, channel_oid, &tip_msg).await;
             let futs: Vec<_> = unread_targets_heal
                 .into_iter()
                 .filter_map(|mid| ObjectId::parse_str(&mid).ok().map(|oid| (mid, oid)))
@@ -904,30 +1024,27 @@ pub async fn create_and_broadcast_channel_message(
         return Ok(ChannelBroadcastOutcome::IdempotentReplay(populated));
     }
 
-    let (mut populated, muted_lookup) = tokio::join!(
-        serialize_message(db, &created),
-        async {
-            use mongodb::bson::Document;
-            let coll = db.collection::<Document>("users");
-            match coll
-                .find(doc! {
-                    "_id": { "$in": &member_oids },
-                    "mutedChannels": channel_oid,
-                })
-                .projection(doc! { "_id": 1 })
-                .await
-            {
-                Ok(cursor) => match cursor.try_collect::<Vec<Document>>().await {
-                    Ok(docs) => Ok(docs
-                        .into_iter()
-                        .filter_map(|d| d.get_object_id("_id").ok().map(|id| id.to_hex()))
-                        .collect::<std::collections::HashSet<String>>()),
-                    Err(_) => Err(()),
-                },
+    let (mut populated, muted_lookup) = tokio::join!(serialize_message(db, &created), async {
+        use mongodb::bson::Document;
+        let coll = db.collection::<Document>("users");
+        match coll
+            .find(doc! {
+                "_id": { "$in": &member_oids },
+                "mutedChannels": channel_oid,
+            })
+            .projection(doc! { "_id": 1 })
+            .await
+        {
+            Ok(cursor) => match cursor.try_collect::<Vec<Document>>().await {
+                Ok(docs) => Ok(docs
+                    .into_iter()
+                    .filter_map(|d| d.get_object_id("_id").ok().map(|id| id.to_hex()))
+                    .collect::<std::collections::HashSet<String>>()),
                 Err(_) => Err(()),
-            }
+            },
+            Err(_) => Err(()),
         }
-    );
+    });
     let muted_lookup_ok = muted_lookup.is_ok();
     let muted_ids = muted_lookup.unwrap_or_default();
 
@@ -957,10 +1074,13 @@ pub async fn create_and_broadcast_channel_message(
             None => Some(false),
         };
         if still_active == Some(false) {
-
             let futs: Vec<_> = unread_targets
                 .iter()
-                .filter_map(|member_id| ObjectId::parse_str(member_id).ok().map(|oid| (member_id.clone(), oid)))
+                .filter_map(|member_id| {
+                    ObjectId::parse_str(member_id)
+                        .ok()
+                        .map(|oid| (member_id.clone(), oid))
+                })
                 .map(|(member_id, oid)| {
                     let db = db.clone();
                     let channel_id_for_unread = channel_id_for_unread.clone();
@@ -969,12 +1089,7 @@ pub async fn create_and_broadcast_channel_message(
                             crate::utils::unread::try_sync_channel_unread(&db, oid, channel_oid)
                                 .await
                         {
-                            emit_unread_absolute(
-                                &member_id,
-                                "channel",
-                                &channel_id_for_unread,
-                                n,
-                            );
+                            emit_unread_absolute(&member_id, "channel", &channel_id_for_unread, n);
                         }
                     }
                 })
@@ -991,7 +1106,6 @@ pub async fn create_and_broadcast_channel_message(
                     mismatch.push((member_id.clone(), oid));
                 }
             } else if let Ok(oid) = ObjectId::parse_str(member_id) {
-
                 bump_oids.push(oid);
             }
             let muted = muted_ids.contains(member_id);
@@ -1015,10 +1129,9 @@ pub async fn create_and_broadcast_channel_message(
                     let member_id = member_id.clone();
                     let oid = *oid;
                     async move {
-                        let n = crate::utils::unread::try_sync_channel_unread(
-                            &db, oid, channel_oid,
-                        )
-                        .await;
+                        let n =
+                            crate::utils::unread::try_sync_channel_unread(&db, oid, channel_oid)
+                                .await;
                         (member_id, n)
                     }
                 })
@@ -1030,7 +1143,6 @@ pub async fn create_and_broadcast_channel_message(
             }
         }
         if !bump_oids.is_empty() {
-
             let mut still_ok = Vec::new();
             let mut late_mismatch: Vec<ObjectId> = Vec::new();
             for oid in bump_oids {
@@ -1049,7 +1161,9 @@ pub async fn create_and_broadcast_channel_message(
                         let db = db.clone();
                         async move {
                             let n = crate::utils::unread::try_sync_channel_unread(
-                                &db, oid, channel_oid,
+                                &db,
+                                oid,
+                                channel_oid,
                             )
                             .await;
                             (oid, n)
@@ -1076,7 +1190,9 @@ pub async fn create_and_broadcast_channel_message(
                             let db = db.clone();
                             async move {
                                 let n = crate::utils::unread::try_sync_channel_unread(
-                                    &db, oid, channel_oid,
+                                    &db,
+                                    oid,
+                                    channel_oid,
                                 )
                                 .await;
                                 (oid, n)
@@ -1090,89 +1206,91 @@ pub async fn create_and_broadcast_channel_message(
                         }
                     }
                 } else {
-                let failed = ChannelReadState::bump_unread_many(
-                    &db,
-                    &still_ok,
-                    channel_oid,
-                    message_ts,
-                )
-                .await;
+                    let failed =
+                        ChannelReadState::bump_unread_many(&db, &still_ok, channel_oid, message_ts)
+                            .await;
 
-                let still_active = match msg_oid {
-                    Some(id) => message_still_active(&db, id).await,
-                    None => Some(false),
-                };
-                let mut post_mismatch: Vec<ObjectId> = failed;
-                let mut bumped_ok: Vec<ObjectId> = Vec::new();
-                for oid in &still_ok {
-                    if post_mismatch.contains(oid) {
-                        continue;
-                    }
-                    let mid = oid.to_hex();
-                    let gen = unread_gens.get(&mid).copied().unwrap_or(0);
-                    if still_active == Some(false)
-                        || peek_unread_generation(&mid, "channel", &channel_id_for_unread) != gen
-                    {
-                        post_mismatch.push(*oid);
-                    } else {
-                        bumped_ok.push(*oid);
-                    }
-                }
-
-                for oid in &bumped_ok {
-                    let mid = oid.to_hex();
-                    let gen = unread_gens.get(&mid).copied().unwrap_or(0);
-                    emit_unread_delta_at(&mid, "channel", &channel_id_for_unread, 1, gen);
-                }
-                if !post_mismatch.is_empty() {
-                    let futs: Vec<_> = post_mismatch
-                        .into_iter()
-                        .map(|oid| {
-                            let db = db.clone();
-                            async move {
-                                let n = crate::utils::unread::try_sync_channel_unread(
-                                    &db, oid, channel_oid,
-                                )
-                                .await;
-                                (oid, n)
-                            }
-                        })
-                        .collect();
-                    let mut still_none: Vec<ObjectId> = Vec::new();
-                    for (oid, n) in futures_util::future::join_all(futs).await {
-                        if let Some(n) = n {
-                            let mid = oid.to_hex();
-                            emit_unread_absolute(&mid, "channel", &channel_id_for_unread, n);
+                    let still_active = match msg_oid {
+                        Some(id) => message_still_active(&db, id).await,
+                        None => Some(false),
+                    };
+                    let mut post_mismatch: Vec<ObjectId> = failed;
+                    let mut bumped_ok: Vec<ObjectId> = Vec::new();
+                    for oid in &still_ok {
+                        if post_mismatch.contains(oid) {
+                            continue;
+                        }
+                        let mid = oid.to_hex();
+                        let gen = unread_gens.get(&mid).copied().unwrap_or(0);
+                        if still_active == Some(false)
+                            || peek_unread_generation(&mid, "channel", &channel_id_for_unread)
+                                != gen
+                        {
+                            post_mismatch.push(*oid);
                         } else {
-                            still_none.push(oid);
+                            bumped_ok.push(*oid);
                         }
                     }
 
-                    if !still_none.is_empty() {
-                        let db_retry = db.clone();
-                        let channel_id_retry = channel_id_for_unread.clone();
-                        tokio::spawn(async move {
-                            for oid in still_none {
-                                for _ in 0..3 {
-                                    if let Some(n) = crate::utils::unread::try_sync_channel_unread(
-                                        &db_retry, oid, channel_oid,
+                    for oid in &bumped_ok {
+                        let mid = oid.to_hex();
+                        let gen = unread_gens.get(&mid).copied().unwrap_or(0);
+                        emit_unread_delta_at(&mid, "channel", &channel_id_for_unread, 1, gen);
+                    }
+                    if !post_mismatch.is_empty() {
+                        let futs: Vec<_> = post_mismatch
+                            .into_iter()
+                            .map(|oid| {
+                                let db = db.clone();
+                                async move {
+                                    let n = crate::utils::unread::try_sync_channel_unread(
+                                        &db,
+                                        oid,
+                                        channel_oid,
                                     )
-                                    .await
-                                    {
-                                        let mid = oid.to_hex();
-                                        emit_unread_absolute(
-                                            &mid,
-                                            "channel",
-                                            &channel_id_retry,
-                                            n,
-                                        );
-                                        break;
+                                    .await;
+                                    (oid, n)
+                                }
+                            })
+                            .collect();
+                        let mut still_none: Vec<ObjectId> = Vec::new();
+                        for (oid, n) in futures_util::future::join_all(futs).await {
+                            if let Some(n) = n {
+                                let mid = oid.to_hex();
+                                emit_unread_absolute(&mid, "channel", &channel_id_for_unread, n);
+                            } else {
+                                still_none.push(oid);
+                            }
+                        }
+
+                        if !still_none.is_empty() {
+                            let db_retry = db.clone();
+                            let channel_id_retry = channel_id_for_unread.clone();
+                            tokio::spawn(async move {
+                                for oid in still_none {
+                                    for _ in 0..3 {
+                                        if let Some(n) =
+                                            crate::utils::unread::try_sync_channel_unread(
+                                                &db_retry,
+                                                oid,
+                                                channel_oid,
+                                            )
+                                            .await
+                                        {
+                                            let mid = oid.to_hex();
+                                            emit_unread_absolute(
+                                                &mid,
+                                                "channel",
+                                                &channel_id_retry,
+                                                n,
+                                            );
+                                            break;
+                                        }
                                     }
                                 }
-                            }
-                        });
+                            });
+                        }
                     }
-                }
                 }
             }
         }
@@ -1217,16 +1335,16 @@ async fn handle_typing(state: SocketState, connected: &str, payload: TypingPaylo
                         Some(recipients)
                     }
                     Err(AccessDeniedReason::Unavailable) => {
-
                         if !is_typing {
                             state.touch_typing(&chat_id, user_id, false);
                             let db = get_db();
                             if let Ok(oid) = ObjectId::parse_str(channel_id) {
                                 if let Ok(Some(channel)) = Channel::find_by_id(&db, oid).await {
-                                    let others: Vec<String> = registry::channel_recipient_ids(&channel)
-                                        .into_iter()
-                                        .filter(|r| r != user_id)
-                                        .collect();
+                                    let others: Vec<String> =
+                                        registry::channel_recipient_ids(&channel)
+                                            .into_iter()
+                                            .filter(|r| r != user_id)
+                                            .collect();
                                     registry::emit_to_users(
                                         &others,
                                         "typing",
@@ -1261,7 +1379,6 @@ async fn handle_typing(state: SocketState, connected: &str, payload: TypingPaylo
                         None
                     }
                     Err(AccessDeniedReason::Unavailable) => {
-
                         if !is_typing {
                             state.touch_typing(&chat_id, user_id, false);
                             registry::emit_to_user(
@@ -1292,10 +1409,7 @@ async fn handle_typing(state: SocketState, connected: &str, payload: TypingPaylo
     let event = json!({ "chatId": chat_id, "userId": user_id, "isTyping": is_typing });
 
     if let Some(recipients) = channel_recipients {
-        let others: Vec<String> = recipients
-            .into_iter()
-            .filter(|r| r != user_id)
-            .collect();
+        let others: Vec<String> = recipients.into_iter().filter(|r| r != user_id).collect();
         registry::emit_to_users(&others, "typing", event);
     } else {
         registry::emit_to_user(&chat_id, "typing", event);
@@ -1310,7 +1424,9 @@ struct ReactionPayload {
 }
 
 async fn handle_reaction(connected: &str, payload: ReactionPayload) {
-    let Some(message_id) = payload.message_id else { return };
+    let Some(message_id) = payload.message_id else {
+        return;
+    };
     let Some(emoji) = payload.emoji else { return };
     let user_id = connected.to_string();
     let emoji = emoji.trim().to_string();
@@ -1321,8 +1437,12 @@ async fn handle_reaction(connected: &str, payload: ReactionPayload) {
     if emoji.contains('.') || emoji.contains('$') {
         return;
     }
-    let Ok(mid) = ObjectId::parse_str(&message_id) else { return };
-    let Ok(uid) = ObjectId::parse_str(&user_id) else { return };
+    let Ok(mid) = ObjectId::parse_str(&message_id) else {
+        return;
+    };
+    let Ok(uid) = ObjectId::parse_str(&user_id) else {
+        return;
+    };
     let db = get_db();
     let msg = match Message::find_by_id(&db, mid).await {
         Ok(Some(m)) => m,
@@ -1433,7 +1553,6 @@ async fn handle_reaction(connected: &str, payload: ReactionPayload) {
         Ok(None) | Err(_) => match Message::find_by_id(&db, mid).await {
             Ok(Some(m)) => m,
             _ => {
-
                 let payload_json = json!({
                     "messageId": message_id,
                     "reactions": reactions_json(&msg),
@@ -1445,13 +1564,25 @@ async fn handle_reaction(connected: &str, payload: ReactionPayload) {
                         let recipients = registry::channel_recipient_ids(&channel);
                         registry::emit_to_users(&recipients, "message-reaction", payload_json);
                     } else if let Some(recipient) = msg.recipient {
-                        registry::emit_to_user(&msg.sender.to_hex(), "message-reaction", payload_json.clone());
-                        registry::emit_to_user(&recipient.to_hex(), "message-reaction", payload_json);
+                        registry::emit_to_user(
+                            &msg.sender.to_hex(),
+                            "message-reaction",
+                            payload_json.clone(),
+                        );
+                        registry::emit_to_user(
+                            &recipient.to_hex(),
+                            "message-reaction",
+                            payload_json,
+                        );
                     } else {
                         registry::emit_to_user(&user_id, "message-reaction", payload_json);
                     }
                 } else if let Some(recipient) = msg.recipient {
-                    registry::emit_to_user(&msg.sender.to_hex(), "message-reaction", payload_json.clone());
+                    registry::emit_to_user(
+                        &msg.sender.to_hex(),
+                        "message-reaction",
+                        payload_json.clone(),
+                    );
                     registry::emit_to_user(&recipient.to_hex(), "message-reaction", payload_json);
                 }
                 registry::emit_to_user(
@@ -1478,32 +1609,43 @@ async fn handle_reaction(connected: &str, payload: ReactionPayload) {
     if let Some(channel_id) = fresh.channel {
         let channel = match Channel::find_by_id(&db, channel_id).await {
             Ok(Some(ch)) => Some(ch),
-
-            Ok(None) | Err(_) => None,
+            Ok(None) => None,
+            Err(error) => {
+                log::error!(
+                    "Failed to load channel {} for reaction fanout: {error}",
+                    channel_id.to_hex()
+                );
+                None
+            }
         };
         if let Some(channel) = channel {
             let recipients = registry::channel_recipient_ids(&channel);
             registry::emit_to_users(&recipients, "message-reaction", payload_json);
         } else {
-            use crate::model::read_state::ChannelReadState;
             let mut recipients = vec![user_id.clone()];
-            if let Ok(cursor) = ChannelReadState::collection(&db)
-                .find(doc! { "channelId": channel_id })
-                .await
-            {
-                let states: Vec<ChannelReadState> =
-                    cursor.try_collect().await.unwrap_or_default();
-                for s in states {
-                    let id = s.user_id.to_hex();
-                    if !recipients.iter().any(|r| r == &id) {
-                        recipients.push(id);
+            match crate::utils::channel::channel_read_state_user_ids(&db, channel_id).await {
+                Ok(user_ids) => {
+                    for id in user_ids {
+                        if !recipients.iter().any(|recipient| recipient == &id) {
+                            recipients.push(id);
+                        }
                     }
+                }
+                Err(error) => {
+                    log::error!(
+                        "Failed to load channel read-state recipients for reaction fanout in channel {}: {error}",
+                        channel_id.to_hex()
+                    );
                 }
             }
             registry::emit_to_users(&recipients, "message-reaction", payload_json);
         }
     } else if let Some(recipient) = fresh.recipient {
-        registry::emit_to_user(&fresh.sender.to_hex(), "message-reaction", payload_json.clone());
+        registry::emit_to_user(
+            &fresh.sender.to_hex(),
+            "message-reaction",
+            payload_json.clone(),
+        );
         registry::emit_to_user(&recipient.to_hex(), "message-reaction", payload_json);
     }
 }
@@ -1516,12 +1658,18 @@ struct MarkMessageReadPayload {
 }
 
 async fn handle_mark_message_read(connected: &str, payload: MarkMessageReadPayload) {
-    let Some(message_id) = payload.message_id else { return };
-    let Some(user_id) = payload.user_id else { return };
+    let Some(message_id) = payload.message_id else {
+        return;
+    };
+    let Some(user_id) = payload.user_id else {
+        return;
+    };
     if !is_connected_user(connected, &user_id) {
         return;
     }
-    let Ok(mid) = ObjectId::parse_str(&message_id) else { return };
+    let Ok(mid) = ObjectId::parse_str(&message_id) else {
+        return;
+    };
     let db = get_db();
     let msg = match Message::find_by_id(&db, mid).await {
         Ok(Some(m)) => m,
@@ -1588,10 +1736,8 @@ async fn handle_mark_message_read(connected: &str, payload: MarkMessageReadPaylo
         "message-read",
         json!({ "messageId": message_id, "read": true }),
     );
-    if let (Ok(viewer), Ok(peer_oid)) = (
-        ObjectId::parse_str(&user_id),
-        ObjectId::parse_str(&peer),
-    ) {
+    if let (Ok(viewer), Ok(peer_oid)) = (ObjectId::parse_str(&user_id), ObjectId::parse_str(&peer))
+    {
         heal_dm_unread_after_mark(&db, &user_id, &peer, viewer, peer_oid).await;
     }
 }
@@ -1604,14 +1750,21 @@ struct MarkConversationReadPayload {
 }
 
 async fn handle_mark_conversation_read(connected: &str, payload: MarkConversationReadPayload) {
-    let Some(user_id) = payload.user_id else { return };
-    let Some(contact_id) = payload.contact_id else { return };
+    let Some(user_id) = payload.user_id else {
+        return;
+    };
+    let Some(contact_id) = payload.contact_id else {
+        return;
+    };
     if !is_connected_user(connected, &user_id) {
         return;
     }
     let db = get_db();
 
-    let (Ok(uid), Ok(cid)) = (ObjectId::parse_str(&user_id), ObjectId::parse_str(&contact_id)) else {
+    let (Ok(uid), Ok(cid)) = (
+        ObjectId::parse_str(&user_id),
+        ObjectId::parse_str(&contact_id),
+    ) else {
         return;
     };
 
@@ -1645,7 +1798,6 @@ async fn handle_mark_conversation_read(connected: &str, payload: MarkConversatio
         }
     };
     if ids.is_empty() {
-
         heal_dm_unread_after_mark(&db, &user_id, &contact_id, uid, cid).await;
         return;
     }
@@ -1707,7 +1859,6 @@ async fn heal_dm_unread_after_mark(
     viewer: ObjectId,
     peer_oid: ObjectId,
 ) {
-
     match crate::utils::tips::try_sync_dm_tip_unread(db, viewer, peer_oid).await {
         Some(tip_n) => {
             emit_unread_absolute(user_id, "dm", peer, tip_n);
@@ -1718,10 +1869,8 @@ async fn heal_dm_unread_after_mark(
             tokio::spawn(async move {
                 let mut n_prev = n_prev;
                 for _ in 0..3 {
-                    let Some(n) = crate::utils::tips::try_sync_dm_tip_unread(
-                        &db_tip, viewer, peer_oid,
-                    )
-                    .await
+                    let Some(n) =
+                        crate::utils::tips::try_sync_dm_tip_unread(&db_tip, viewer, peer_oid).await
                     else {
                         break;
                     };
@@ -1734,17 +1883,14 @@ async fn heal_dm_unread_after_mark(
             });
         }
         None => {
-
             crate::utils::unread::invalidate_unread_generation(user_id, "dm", peer);
             let db_tip = db.clone();
             let user_id = user_id.to_string();
             let peer = peer.to_string();
             tokio::spawn(async move {
                 for _ in 0..3 {
-                    if let Some(n) = crate::utils::tips::try_sync_dm_tip_unread(
-                        &db_tip, viewer, peer_oid,
-                    )
-                    .await
+                    if let Some(n) =
+                        crate::utils::tips::try_sync_dm_tip_unread(&db_tip, viewer, peer_oid).await
                     {
                         emit_unread_absolute(&user_id, "dm", &peer, n);
                         if n == 0 {
@@ -1765,8 +1911,12 @@ struct MarkChannelReadPayload {
 }
 
 async fn handle_mark_channel_read(connected: &str, payload: MarkChannelReadPayload) {
-    let Some(user_id) = payload.user_id else { return };
-    let Some(channel_id) = payload.channel_id else { return };
+    let Some(user_id) = payload.user_id else {
+        return;
+    };
+    let Some(channel_id) = payload.channel_id else {
+        return;
+    };
     if !is_connected_user(connected, &user_id) {
         return;
     }
@@ -1831,9 +1981,10 @@ async fn handle_mark_channel_read(connected: &str, payload: MarkChannelReadPaylo
                 });
             }
             None => {
-
                 crate::utils::unread::invalidate_unread_generation(
-                    &user_id, "channel", &channel_id,
+                    &user_id,
+                    "channel",
+                    &channel_id,
                 );
                 let db_tip = db.clone();
                 let user_id = user_id.clone();
@@ -1864,13 +2015,21 @@ struct EditMessagePayload {
 }
 
 async fn handle_edit_message(connected: &str, payload: EditMessagePayload) {
-    let Some(message_id) = payload.message_id else { return };
-    let Some(content_raw) = payload.content else { return };
-    let Some(user_id) = payload.user_id else { return };
+    let Some(message_id) = payload.message_id else {
+        return;
+    };
+    let Some(content_raw) = payload.content else {
+        return;
+    };
+    let Some(user_id) = payload.user_id else {
+        return;
+    };
     if !is_connected_user(connected, &user_id) {
         return;
     }
-    let Ok(mid) = ObjectId::parse_str(&message_id) else { return };
+    let Ok(mid) = ObjectId::parse_str(&message_id) else {
+        return;
+    };
     let db = get_db();
     let msg = match Message::find_by_id(&db, mid).await {
         Ok(Some(m)) => m,
@@ -1926,8 +2085,7 @@ async fn handle_edit_message(connected: &str, payload: EditMessagePayload) {
     if prepared_content.is_empty() {
         return;
     }
-    if !crate::model::messages::is_message_content_within_limit(&prepared_content)
-    {
+    if !crate::model::messages::is_message_content_within_limit(&prepared_content) {
         registry::emit_to_user(
             connected,
             "error",
@@ -2127,8 +2285,7 @@ async fn handle_edit_message(connected: &str, payload: EditMessagePayload) {
         let preview_content = prepared_content.clone();
 
         let muted_lookup: Option<std::collections::HashSet<String>> =
-            if let (Some(channel_oid), Some(ref channel)) =
-                (updated.channel, channel_doc.as_ref())
+            if let (Some(channel_oid), Some(ref channel)) = (updated.channel, channel_doc.as_ref())
             {
                 use mongodb::bson::Document;
                 let coll = db.collection::<Document>("users");
@@ -2241,7 +2398,11 @@ async fn handle_edit_message(connected: &str, payload: EditMessagePayload) {
         } else if let Some(recipient) = updated.recipient {
             let recipient_hex = recipient.to_hex();
             registry::emit_to_user(&recipient_hex, "message-edited", populated.clone());
-            registry::emit_to_user(&updated.sender.to_hex(), "message-edited", populated.clone());
+            registry::emit_to_user(
+                &updated.sender.to_hex(),
+                "message-edited",
+                populated.clone(),
+            );
             ping_if_new(&recipient_hex, &sender_id, None);
         }
     }
@@ -2255,12 +2416,18 @@ struct DeleteMessagePayload {
 }
 
 async fn handle_delete_message(connected: &str, payload: DeleteMessagePayload) {
-    let Some(message_id) = payload.message_id else { return };
-    let Some(user_id) = payload.user_id else { return };
+    let Some(message_id) = payload.message_id else {
+        return;
+    };
+    let Some(user_id) = payload.user_id else {
+        return;
+    };
     if !is_connected_user(connected, &user_id) {
         return;
     }
-    let Ok(mid) = ObjectId::parse_str(&message_id) else { return };
+    let Ok(mid) = ObjectId::parse_str(&message_id) else {
+        return;
+    };
     let db = get_db();
     let msg = match Message::find_by_id(&db, mid).await {
         Ok(Some(m)) => m,
@@ -2332,10 +2499,7 @@ async fn handle_delete_message(connected: &str, payload: DeleteMessagePayload) {
             let mut targets: Vec<String> = channel.members.iter().map(|m| m.to_hex()).collect();
             targets.push(channel.admin.to_hex());
 
-            crate::utils::tips::refresh_channel_tip_after_delete(
-                &db, channel_id, mid,
-            )
-            .await;
+            crate::utils::tips::refresh_channel_tip_after_delete(&db, channel_id, mid).await;
             {
                 use crate::model::read_state::ChannelReadState;
                 use futures_util::TryStreamExt;
@@ -2344,10 +2508,8 @@ async fn handle_delete_message(connected: &str, payload: DeleteMessagePayload) {
                     .iter()
                     .filter_map(|id| ObjectId::parse_str(id).ok())
                     .collect();
-                let mut last_reads: std::collections::HashMap<
-                    String,
-                    (DateTime, DateTime),
-                > = std::collections::HashMap::new();
+                let mut last_reads: std::collections::HashMap<String, (DateTime, DateTime)> =
+                    std::collections::HashMap::new();
                 let mut read_state_ok = false;
                 if let Ok(cursor) = ChannelReadState::collection(&db)
                     .find(doc! {
@@ -2381,7 +2543,6 @@ async fn handle_delete_message(connected: &str, payload: DeleteMessagePayload) {
                             return Some((member_id, oid));
                         }
                         let Some(&(last, created)) = last_reads.get(&member_id) else {
-
                             return Some((member_id, oid));
                         };
 
@@ -2402,18 +2563,11 @@ async fn handle_delete_message(connected: &str, payload: DeleteMessagePayload) {
                         let db = db.clone();
                         let channel_id_hex = channel_id_hex.clone();
                         async move {
-
-                            if let Some(n) = crate::utils::unread::try_sync_channel_unread(
-                                &db, oid, channel_id,
-                            )
-                            .await
+                            if let Some(n) =
+                                crate::utils::unread::try_sync_channel_unread(&db, oid, channel_id)
+                                    .await
                             {
-                                emit_unread_absolute(
-                                    &member_id,
-                                    "channel",
-                                    &channel_id_hex,
-                                    n,
-                                );
+                                emit_unread_absolute(&member_id, "channel", &channel_id_hex, n);
                             }
                         }
                     })
@@ -2421,10 +2575,7 @@ async fn handle_delete_message(connected: &str, payload: DeleteMessagePayload) {
                 futures_util::future::join_all(sync_futs).await;
             }
         } else {
-            crate::utils::tips::refresh_channel_tip_after_delete(
-                &db, channel_id, mid,
-            )
-            .await;
+            crate::utils::tips::refresh_channel_tip_after_delete(&db, channel_id, mid).await;
             registry::emit_to_user(&msg.sender.to_hex(), "message-deleted", body.clone());
 
             registry::emit_to_user(
@@ -2460,12 +2611,7 @@ async fn handle_delete_message(connected: &str, payload: DeleteMessagePayload) {
                                 )
                                 .await
                                 {
-                                    emit_unread_absolute(
-                                        &member_id,
-                                        "channel",
-                                        &channel_id_hex,
-                                        n,
-                                    );
+                                    emit_unread_absolute(&member_id, "channel", &channel_id_hex, n);
                                 }
                             }
                         }
@@ -2495,23 +2641,14 @@ async fn handle_delete_message(connected: &str, payload: DeleteMessagePayload) {
         registry::emit_to_user(&recipient_hex, "message-deleted", body.clone());
         registry::emit_to_user(&msg.sender.to_hex(), "message-deleted", body);
         let sender_oid = msg.sender;
-        crate::utils::tips::refresh_dm_tip_after_delete(
-            &db,
-            sender_oid,
-            recipient,
-            mid,
-        )
-        .await;
+        crate::utils::tips::refresh_dm_tip_after_delete(&db, sender_oid, recipient, mid).await;
         if was_unread {
-
             if crate::utils::unread::try_count_dm_unread(&db, recipient, sender_oid)
                 .await
                 .is_some()
             {
-                if let Some(n) = crate::utils::tips::try_sync_dm_tip_unread(
-                    &db, recipient, sender_oid,
-                )
-                .await
+                if let Some(n) =
+                    crate::utils::tips::try_sync_dm_tip_unread(&db, recipient, sender_oid).await
                 {
                     emit_unread_absolute(&recipient_hex, "dm", &sender_oid.to_hex(), n);
                 }
@@ -2606,7 +2743,11 @@ async fn handle_call_invite(
     }
     match try_is_dm_blocked(&db, &from, &to).await {
         Ok(true) => {
-            registry::emit_to_user(&from, "call:unavailable", json!({ "to": to, "reason": "BLOCKED" }));
+            registry::emit_to_user(
+                &from,
+                "call:unavailable",
+                json!({ "to": to, "reason": "BLOCKED" }),
+            );
             return;
         }
         Ok(false) => {}
@@ -2626,8 +2767,7 @@ async fn handle_call_invite(
         "audio"
     };
 
-    let (session_id, replaced_expired) =
-        match create_ringing_session(&from, &to, mode, conn_id) {
+    let (session_id, replaced_expired) = match create_ringing_session(&from, &to, mode, conn_id) {
         Ok(result) => result,
         Err(CallSessionError::InProgress) => {
             registry::emit_to_user(
@@ -2650,15 +2790,17 @@ async fn handle_call_invite(
         .await
         .ok()
         .flatten();
-    let caller_json = caller.map(|u| {
-        json!({
-            "_id": from,
-            "username": u.username,
-            "displayName": resolve_display_name(&u),
-            "image": u.image,
-            "color": u.color,
+    let caller_json = caller
+        .map(|u| {
+            json!({
+                "_id": from,
+                "username": u.username,
+                "displayName": resolve_display_name(&u),
+                "image": u.image,
+                "color": u.color,
+            })
         })
-    }).unwrap_or(json!({ "_id": from }));
+        .unwrap_or(json!({ "_id": from }));
 
     if state.is_user_connected(&to) {
         registry::emit_to_user(
@@ -2695,10 +2837,7 @@ async fn handle_call_simple(
 
     let db = get_db();
 
-    let teardown_only = matches!(
-        incoming_event,
-        "call:reject" | "call:cancel" | "call:end"
-    );
+    let teardown_only = matches!(incoming_event, "call:reject" | "call:cancel" | "call:end");
     if !teardown_only {
         match crate::utils::friends::try_are_friends(&db, &from, &to).await {
             Ok(true) => {}
@@ -2741,134 +2880,124 @@ async fn handle_call_simple(
     }
 
     match incoming_event {
-        "call:accept" => {
-            match accept_session(&from, &to, conn_id) {
-                Ok(_) => {
-                    registry::emit_to_user(&to, outgoing, json!({ "from": from }));
-                    registry::emit_to_user(&from, outgoing, json!({ "from": from }));
-                }
-                Err(CallSessionError::Expired(expired)) => {
-                    finalize_expired_ringing_session(&db, expired).await;
-                }
-                Err(err) => {
-                    let reason = match err {
-                        CallSessionError::NotFound => "NOT_FOUND",
-                        CallSessionError::WrongRole => "WRONG_ROLE",
-                        CallSessionError::InvalidPhase => "INVALID_PHASE",
-                        CallSessionError::InProgress => "BUSY",
-                        CallSessionError::Expired(_) => "EXPIRED",
-                    };
-                    registry::emit_to_user(
-                        &from,
-                        "call:unavailable",
-                        json!({ "to": to, "reason": reason }),
-                    );
-                }
+        "call:accept" => match accept_session(&from, &to, conn_id) {
+            Ok(_) => {
+                registry::emit_to_user(&to, outgoing, json!({ "from": from }));
+                registry::emit_to_user(&from, outgoing, json!({ "from": from }));
             }
-        }
-        "call:reject" => {
-            match reject_session(&from, &to) {
-                Ok(()) => {
-
-                    create_missed_call_log_message(&db, &to, &from).await;
-                    registry::emit_to_user(&to, outgoing, json!({ "from": from }));
-
-                    registry::emit_to_user(&from, outgoing, json!({ "from": from }));
-                }
-                Err(CallSessionError::Expired(expired)) => {
-                    finalize_expired_ringing_session(&db, expired).await;
-                }
-                Err(err) => {
-                    let reason = match err {
-                        CallSessionError::NotFound => "NOT_FOUND",
-                        CallSessionError::WrongRole => "WRONG_ROLE",
-                        CallSessionError::InvalidPhase => "INVALID_PHASE",
-                        CallSessionError::InProgress => "BUSY",
-                        CallSessionError::Expired(_) => "EXPIRED",
-                    };
-                    registry::emit_to_user(
-                        &from,
-                        "call:unavailable",
-                        json!({ "to": to, "reason": reason }),
-                    );
-                }
+            Err(CallSessionError::Expired(expired)) => {
+                finalize_expired_ringing_session(&db, expired).await;
             }
-        }
-        "call:cancel" => {
-
-            match cancel_session(&from, &to) {
-                Ok(()) => {
-                    registry::emit_to_user(&to, outgoing, json!({ "from": from }));
-
-                    registry::emit_to_user(&from, outgoing, json!({ "from": from }));
-                }
-                Err(CallSessionError::Expired(expired)) => {
-                    finalize_expired_ringing_session(&db, expired).await;
-                }
-                Err(err) => {
-                    let reason = match err {
-                        CallSessionError::NotFound => "NOT_FOUND",
-                        CallSessionError::WrongRole => "WRONG_ROLE",
-                        CallSessionError::InvalidPhase => "INVALID_PHASE",
-                        CallSessionError::InProgress => "BUSY",
-                        CallSessionError::Expired(_) => "EXPIRED",
-                    };
-                    registry::emit_to_user(
-                        &from,
-                        "call:unavailable",
-                        json!({ "to": to, "reason": reason }),
-                    );
-                }
+            Err(err) => {
+                let reason = match err {
+                    CallSessionError::NotFound => "NOT_FOUND",
+                    CallSessionError::WrongRole => "WRONG_ROLE",
+                    CallSessionError::InvalidPhase => "INVALID_PHASE",
+                    CallSessionError::InProgress => "BUSY",
+                    CallSessionError::Expired(_) => "EXPIRED",
+                };
+                registry::emit_to_user(
+                    &from,
+                    "call:unavailable",
+                    json!({ "to": to, "reason": reason }),
+                );
             }
-        }
-        "call:end" => {
-            match end_session(&from, &to) {
-                Ok(session) => {
-                    registry::emit_to_user(&to, outgoing, json!({ "from": from }));
+        },
+        "call:reject" => match reject_session(&from, &to) {
+            Ok(()) => {
+                create_missed_call_log_message(&db, &to, &from).await;
+                registry::emit_to_user(&to, outgoing, json!({ "from": from }));
 
-                    registry::emit_to_user(&from, outgoing, json!({ "from": from }));
-                    match session.phase {
-                        CallPhase::Accepted => {
-                            if let Some(accepted_at) = session.accepted_at {
-                                let secs = accepted_at.elapsed().as_secs();
-                                create_call_log_message(
-                                    &db,
-                                    &session.caller_id,
-                                    &session.callee_id,
-                                    secs,
-                                )
-                                .await;
-                            }
+                registry::emit_to_user(&from, outgoing, json!({ "from": from }));
+            }
+            Err(CallSessionError::Expired(expired)) => {
+                finalize_expired_ringing_session(&db, expired).await;
+            }
+            Err(err) => {
+                let reason = match err {
+                    CallSessionError::NotFound => "NOT_FOUND",
+                    CallSessionError::WrongRole => "WRONG_ROLE",
+                    CallSessionError::InvalidPhase => "INVALID_PHASE",
+                    CallSessionError::InProgress => "BUSY",
+                    CallSessionError::Expired(_) => "EXPIRED",
+                };
+                registry::emit_to_user(
+                    &from,
+                    "call:unavailable",
+                    json!({ "to": to, "reason": reason }),
+                );
+            }
+        },
+        "call:cancel" => match cancel_session(&from, &to) {
+            Ok(()) => {
+                registry::emit_to_user(&to, outgoing, json!({ "from": from }));
+
+                registry::emit_to_user(&from, outgoing, json!({ "from": from }));
+            }
+            Err(CallSessionError::Expired(expired)) => {
+                finalize_expired_ringing_session(&db, expired).await;
+            }
+            Err(err) => {
+                let reason = match err {
+                    CallSessionError::NotFound => "NOT_FOUND",
+                    CallSessionError::WrongRole => "WRONG_ROLE",
+                    CallSessionError::InvalidPhase => "INVALID_PHASE",
+                    CallSessionError::InProgress => "BUSY",
+                    CallSessionError::Expired(_) => "EXPIRED",
+                };
+                registry::emit_to_user(
+                    &from,
+                    "call:unavailable",
+                    json!({ "to": to, "reason": reason }),
+                );
+            }
+        },
+        "call:end" => match end_session(&from, &to) {
+            Ok(session) => {
+                registry::emit_to_user(&to, outgoing, json!({ "from": from }));
+
+                registry::emit_to_user(&from, outgoing, json!({ "from": from }));
+                match session.phase {
+                    CallPhase::Accepted => {
+                        if let Some(accepted_at) = session.accepted_at {
+                            let secs = accepted_at.elapsed().as_secs();
+                            create_call_log_message(
+                                &db,
+                                &session.caller_id,
+                                &session.callee_id,
+                                secs,
+                            )
+                            .await;
                         }
+                    }
 
-                        CallPhase::Ringing => {
-                            if from == session.callee_id {
-                                create_missed_call_log_message(
-                                    &db,
-                                    &session.caller_id,
-                                    &session.callee_id,
-                                )
-                                .await;
-                            }
+                    CallPhase::Ringing => {
+                        if from == session.callee_id {
+                            create_missed_call_log_message(
+                                &db,
+                                &session.caller_id,
+                                &session.callee_id,
+                            )
+                            .await;
                         }
                     }
                 }
-                Err(err) => {
-                    let reason = match err {
-                        CallSessionError::NotFound => "NOT_FOUND",
-                        CallSessionError::WrongRole => "WRONG_ROLE",
-                        CallSessionError::InvalidPhase => "INVALID_PHASE",
-                        CallSessionError::InProgress => "BUSY",
-                        CallSessionError::Expired(_) => "EXPIRED",
-                    };
-                    registry::emit_to_user(
-                        &from,
-                        "call:unavailable",
-                        json!({ "to": to, "reason": reason }),
-                    );
-                }
             }
-        }
+            Err(err) => {
+                let reason = match err {
+                    CallSessionError::NotFound => "NOT_FOUND",
+                    CallSessionError::WrongRole => "WRONG_ROLE",
+                    CallSessionError::InvalidPhase => "INVALID_PHASE",
+                    CallSessionError::InProgress => "BUSY",
+                    CallSessionError::Expired(_) => "EXPIRED",
+                };
+                registry::emit_to_user(
+                    &from,
+                    "call:unavailable",
+                    json!({ "to": to, "reason": reason }),
+                );
+            }
+        },
         _ => {}
     }
 }
@@ -2922,7 +3051,6 @@ async fn emit_channel_voice_state(channel_id: &str, participants: &[String]) {
     });
     let db = get_db();
     let Ok(channel_oid) = ObjectId::parse_str(channel_id) else {
-
         let recipients: Vec<String> = participants.to_vec();
         if !recipients.is_empty() {
             registry::emit_to_users(&recipients, "channel-voice:state", body);
@@ -2951,7 +3079,11 @@ async fn emit_channel_voice_state(channel_id: &str, participants: &[String]) {
 }
 
 async fn handle_channel_voice_join(connected: &str, payload: ChannelVoicePayload, conn_id: u64) {
-    let Some(channel_id) = payload.channel_id.as_deref().map(str::trim).filter(|s| !s.is_empty())
+    let Some(channel_id) = payload
+        .channel_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
     else {
         return;
     };
@@ -2994,7 +3126,11 @@ async fn handle_channel_voice_join(connected: &str, payload: ChannelVoicePayload
 }
 
 async fn handle_channel_voice_leave(connected: &str, payload: ChannelVoicePayload) {
-    let Some(channel_id) = payload.channel_id.as_deref().map(str::trim).filter(|s| !s.is_empty())
+    let Some(channel_id) = payload
+        .channel_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
     else {
         return;
     };
@@ -3022,7 +3158,11 @@ async fn handle_channel_voice_leave(connected: &str, payload: ChannelVoicePayloa
 }
 
 async fn handle_channel_voice_state_request(connected: &str, payload: ChannelVoicePayload) {
-    let Some(channel_id) = payload.channel_id.as_deref().map(str::trim).filter(|s| !s.is_empty())
+    let Some(channel_id) = payload
+        .channel_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
     else {
         return;
     };
@@ -3078,7 +3218,12 @@ fn format_call_duration(total_secs: u64) -> String {
     }
 }
 
-async fn create_call_log_message(db: &Database, caller_id: &str, callee_id: &str, duration_secs: u64) {
+async fn create_call_log_message(
+    db: &Database,
+    caller_id: &str,
+    callee_id: &str,
+    duration_secs: u64,
+) {
     persist_call_log(
         db,
         caller_id,
@@ -3131,6 +3276,25 @@ async fn persist_call_log(
 
     let unread_gen = peek_unread_generation(callee_id, "dm", caller_id);
 
+    let _dm_write_guard = match crate::utils::messages::conversation_writes::reserve_message_write(
+        db, caller, callee,
+    )
+    .await
+    {
+        Ok(Some(guard)) => guard,
+        Ok(None) => {
+            log::info!(
+                "Skipping call log because DM conversation is being deleted: {} / {}",
+                caller_id,
+                callee_id
+            );
+            return;
+        }
+        Err(error) => {
+            log::error!("Failed to reserve DM conversation write for call log: {error}");
+            return;
+        }
+    };
     let created = match Message::create(db, input).await {
         Ok(CreateMessageOutcome::Created(m) | CreateMessageOutcome::IdempotentReplay(m)) => m,
         Err(e) => {
@@ -3161,18 +3325,15 @@ async fn persist_call_log(
                 None => Some(false),
             };
             if still_active == Some(false) {
-                if let Some(n) = crate::utils::tips::try_sync_dm_tip_unread(
-                    &db_tip, callee_oid, caller_oid,
-                )
-                .await
+                if let Some(n) =
+                    crate::utils::tips::try_sync_dm_tip_unread(&db_tip, callee_oid, caller_oid)
+                        .await
                 {
                     crate::utils::unread::emit_unread_absolute(&callee_id, "dm", &caller_id, n);
                 }
             } else if peek_unread_generation(&callee_id, "dm", &caller_id) == unread_gen {
-                let bumped = crate::utils::tips::bump_dm_unread(
-                    &db_tip, caller_oid, callee_oid,
-                )
-                .await;
+                let bumped =
+                    crate::utils::tips::bump_dm_unread(&db_tip, caller_oid, callee_oid).await;
                 let still_active = match tip_mid {
                     Some(id) => message_still_active(&db_tip, id).await,
                     None => Some(false),
@@ -3182,17 +3343,14 @@ async fn persist_call_log(
                     && peek_unread_generation(&callee_id, "dm", &caller_id) == unread_gen
                 {
                     emit_unread_delta_at(&callee_id, "dm", &caller_id, 1, unread_gen);
-                } else if let Some(n) = crate::utils::tips::try_sync_dm_tip_unread(
-                    &db_tip, callee_oid, caller_oid,
-                )
-                .await
+                } else if let Some(n) =
+                    crate::utils::tips::try_sync_dm_tip_unread(&db_tip, callee_oid, caller_oid)
+                        .await
                 {
                     crate::utils::unread::emit_unread_absolute(&callee_id, "dm", &caller_id, n);
                 }
-            } else if let Some(n) = crate::utils::tips::try_sync_dm_tip_unread(
-                &db_tip, callee_oid, caller_oid,
-            )
-            .await
+            } else if let Some(n) =
+                crate::utils::tips::try_sync_dm_tip_unread(&db_tip, callee_oid, caller_oid).await
             {
                 crate::utils::unread::emit_unread_absolute(&callee_id, "dm", &caller_id, n);
             }
@@ -3242,12 +3400,7 @@ fn payload_client_nonce(payload: &Value) -> Option<&str> {
         .filter(|s| !s.is_empty() && s.len() <= 64)
 }
 
-fn emit_send_error(
-    user_id: &str,
-    code: &str,
-    message: &str,
-    client_nonce: Option<&str>,
-) {
+fn emit_send_error(user_id: &str, code: &str, message: &str, client_nonce: Option<&str>) {
     let mut body = json!({
         "code": code,
         "message": message,
@@ -3338,11 +3491,7 @@ pub async fn finalize_taken_call_sessions(user_id: &str, call_sessions: Vec<Call
         match session.phase {
             CallPhase::Ringing => {
                 if session.caller_id == user_id {
-                    registry::emit_to_user(
-                        &peer,
-                        "call:cancelled",
-                        json!({ "from": user_id }),
-                    );
+                    registry::emit_to_user(&peer, "call:cancelled", json!({ "from": user_id }));
 
                     registry::emit_to_user(
                         user_id,
@@ -3350,12 +3499,7 @@ pub async fn finalize_taken_call_sessions(user_id: &str, call_sessions: Vec<Call
                         json!({ "from": user_id, "reason": "TAB_CLOSED" }),
                     );
                 } else {
-
-                    registry::emit_to_user(
-                        &peer,
-                        "call:rejected",
-                        json!({ "from": user_id }),
-                    );
+                    registry::emit_to_user(&peer, "call:rejected", json!({ "from": user_id }));
                     create_missed_call_log_message(&db, &session.caller_id, &session.callee_id)
                         .await;
                 }
@@ -3365,13 +3509,8 @@ pub async fn finalize_taken_call_sessions(user_id: &str, call_sessions: Vec<Call
                 registry::emit_to_user(user_id, "call:ended", json!({ "from": user_id }));
                 if let Some(accepted_at) = session.accepted_at {
                     let secs = accepted_at.elapsed().as_secs();
-                    create_call_log_message(
-                        &db,
-                        &session.caller_id,
-                        &session.callee_id,
-                        secs,
-                    )
-                    .await;
+                    create_call_log_message(&db, &session.caller_id, &session.callee_id, secs)
+                        .await;
                 }
             }
         }
@@ -3379,14 +3518,12 @@ pub async fn finalize_taken_call_sessions(user_id: &str, call_sessions: Vec<Call
 }
 
 pub async fn on_user_disconnected(user_id: &str, socket_state: &SocketState) {
-
     if socket_state.is_user_connected(user_id) || socket_state.connection_count(user_id) > 0 {
         return;
     }
 
     let call_sessions = take_sessions_for_user(user_id);
     if socket_state.is_user_connected(user_id) || socket_state.connection_count(user_id) > 0 {
-
         restore_sessions(call_sessions);
         return;
     }
@@ -3448,9 +3585,7 @@ pub async fn dispatch_message(
             }
         }
         "send-channel-message" => {
-            if !state
-                .check_rate_limit(connected, "send-channel-message", 60, 60_000)
-            {
+            if !state.check_rate_limit(connected, "send-channel-message", 60, 60_000) {
                 emit_rate_limit_error(connected, payload_client_nonce(&payload));
                 return;
             }
@@ -3466,7 +3601,6 @@ pub async fn dispatch_message(
         }
         "typing" => {
             if let Ok(p) = serde_json::from_value::<TypingPayload>(payload) {
-
                 if p.is_typing.unwrap_or(false) {
                     let chat_key = p
                         .chat_id
@@ -3496,9 +3630,7 @@ pub async fn dispatch_message(
             }
         }
         "message-reaction" => {
-            if !state
-                .check_rate_limit(connected, "message-reaction", 120, 60_000)
-            {
+            if !state.check_rate_limit(connected, "message-reaction", 120, 60_000) {
                 emit_rate_limit_error(connected, None);
                 return;
             }
@@ -3512,9 +3644,7 @@ pub async fn dispatch_message(
             }
         }
         "mark-message-read" => {
-            if !state
-                .check_rate_limit(connected, "mark-message-read", 300, 60_000)
-            {
+            if !state.check_rate_limit(connected, "mark-message-read", 300, 60_000) {
                 emit_rate_limit_error(connected, None);
                 return;
             }
@@ -3528,9 +3658,7 @@ pub async fn dispatch_message(
             }
         }
         "mark-conversation-read" => {
-            if !state
-                .check_rate_limit(connected, "mark-conversation-read", 60, 60_000)
-            {
+            if !state.check_rate_limit(connected, "mark-conversation-read", 60, 60_000) {
                 emit_rate_limit_error(connected, None);
                 return;
             }
@@ -3544,9 +3672,7 @@ pub async fn dispatch_message(
             }
         }
         "mark-channel-read" => {
-            if !state
-                .check_rate_limit(connected, "mark-channel-read", 300, 60_000)
-            {
+            if !state.check_rate_limit(connected, "mark-channel-read", 300, 60_000) {
                 emit_rate_limit_error(connected, None);
                 return;
             }
@@ -3595,9 +3721,12 @@ pub async fn dispatch_message(
             if let Ok(p) = serde_json::from_value::<CallPayload>(payload) {
                 let user_id = connected.to_string();
                 let state = state.clone();
-                if !state.clone().spawn_user_realtime(user_id.clone(), async move {
-                    handle_call_invite(&user_id, p, &state, conn_id).await;
-                }) {
+                if !state
+                    .clone()
+                    .spawn_user_realtime(user_id.clone(), async move {
+                        handle_call_invite(&user_id, p, &state, conn_id).await;
+                    })
+                {
                     emit_queue_full_error(connected, None);
                 }
             }

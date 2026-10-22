@@ -31,7 +31,6 @@ fn normalize_client_ip_candidate(raw: &str) -> Option<String> {
             ip = &ip[1..end];
         }
     } else if ip.contains(':') && ip.contains('.') {
-
         if let Some(host) = ip.rsplit_once(':').map(|(host, _)| host) {
             ip = host;
         }
@@ -104,9 +103,7 @@ fn ip_from_http_headers(headers: &HeaderMap) -> Option<String> {
             .get("cf-connecting-ip")
             .and_then(|v| v.to_str().ok()),
         headers.get("true-client-ip").and_then(|v| v.to_str().ok()),
-        headers
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok()),
+        headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()),
         headers.get("forwarded").and_then(|v| v.to_str().ok()),
         headers.get("x-real-ip").and_then(|v| v.to_str().ok()),
     )
@@ -118,9 +115,7 @@ fn ip_from_actix_headers(headers: &actix_web::http::header::HeaderMap) -> Option
             .get("cf-connecting-ip")
             .and_then(|v| v.to_str().ok()),
         headers.get("true-client-ip").and_then(|v| v.to_str().ok()),
-        headers
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok()),
+        headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()),
         headers.get("forwarded").and_then(|v| v.to_str().ok()),
         headers.get("x-real-ip").and_then(|v| v.to_str().ok()),
     )

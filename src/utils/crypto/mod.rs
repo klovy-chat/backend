@@ -6,7 +6,7 @@
 // Field key ≠ JWT_KEY.
 // Przy zmianach: encrypt.rs.
 
-pub mod passwords;
 pub mod encrypt;
 pub mod hmac;
+pub mod passwords;
 pub mod token_hash;

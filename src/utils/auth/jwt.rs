@@ -13,10 +13,10 @@ use std::env;
 use crate::middlewares::auth::TokenPayload;
 use crate::model::refresh_tokens::RefreshToken;
 use crate::model::users::User;
-use crate::utils::env::is_production;
-use crate::utils::auth::validation::hs256_validation;
 use crate::utils::auth::refresh::{family_id_from_refresh_token, RefreshAuthError};
+use crate::utils::auth::validation::hs256_validation;
 use crate::utils::db::get_db;
+use crate::utils::env::is_production;
 
 pub fn jwt_secret() -> Result<String, String> {
     let key = env::var("JWT_KEY").map_err(|_| "JWT_KEY is not defined".to_string())?;
@@ -91,9 +91,7 @@ pub fn session_family_from_jwt(token: &str) -> Option<String> {
         .ok()?
         .claims;
 
-    payload
-        .session_family_id
-        .filter(|id| !id.is_empty())
+    payload.session_family_id.filter(|id| !id.is_empty())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,8 +128,7 @@ pub async fn user_from_token_payload(
         return Err(JwtUserError::Denied);
     }
 
-    let user_id =
-        ObjectId::parse_str(&payload.user_id).map_err(|_| JwtUserError::Denied)?;
+    let user_id = ObjectId::parse_str(&payload.user_id).map_err(|_| JwtUserError::Denied)?;
     let db = get_db();
     let user = match User::find_by_id(&db, user_id).await {
         Ok(Some(u)) => u,

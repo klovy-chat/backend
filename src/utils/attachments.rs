@@ -10,8 +10,8 @@ use actix_web::HttpRequest;
 use serde_json::json;
 
 use crate::model::audit::AuditLog;
-use crate::utils::ip::client_ip_from_http_request;
 use crate::utils::db::get_db;
+use crate::utils::ip::client_ip_from_http_request;
 
 pub async fn log_attachment_upload(
     req: &HttpRequest,

@@ -10,9 +10,7 @@ use actix_web::web;
 use actix_web_lab::middleware::from_fn;
 
 use crate::controllers::gifs::{search_gifs, trending_gifs};
-use crate::middlewares::auth::{
-    log_suspicious_activity, require_active_account, verify_token,
-};
+use crate::middlewares::auth::{log_suspicious_activity, require_active_account, verify_token};
 use crate::utils::ratelimit::discovery_limiter;
 
 pub fn configure(cfg: &mut web::ServiceConfig) {

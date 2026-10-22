@@ -15,8 +15,7 @@ pub const EXPECTED_CLIENT: &str = "KlovyChatApp";
 pub fn is_valid_client_identifier(value: &str) -> bool {
     let v = value.trim();
     v == EXPECTED_CLIENT
-        || v
-            .strip_prefix(EXPECTED_CLIENT)
+        || v.strip_prefix(EXPECTED_CLIENT)
             .is_some_and(|rest| rest.starts_with('/'))
 }
 

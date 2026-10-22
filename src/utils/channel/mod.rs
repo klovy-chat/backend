@@ -15,11 +15,12 @@ use serde_json::{json, Value};
 
 use crate::model::channel_moderation::has_active_entry;
 use crate::model::channels::Channel;
-use crate::model::read_state::ChannelReadState;
 use crate::model::messages::Message;
+use crate::model::read_state::ChannelReadState;
 use crate::model::users::User;
 use crate::utils::user::json::resolve_display_name;
 
+pub mod deletion;
 pub mod moderation;
 
 pub fn channel_member_count(channel: &Channel) -> usize {
@@ -32,6 +33,9 @@ pub fn channel_member_count(channel: &Channel) -> usize {
 }
 
 pub fn is_channel_admin(channel: &Channel, user_id: Option<&str>) -> bool {
+    if channel.is_deleting {
+        return false;
+    }
     match user_id {
         Some(uid) if !uid.is_empty() => channel.admin.to_hex() == uid,
         _ => false,
@@ -39,6 +43,9 @@ pub fn is_channel_admin(channel: &Channel, user_id: Option<&str>) -> bool {
 }
 
 pub fn is_channel_member(channel: &Channel, user_id: Option<&str>) -> bool {
+    if channel.is_deleting {
+        return false;
+    }
     let Some(uid) = user_id.filter(|u| !u.is_empty()) else {
         return false;
     };
@@ -63,7 +70,24 @@ pub fn is_channel_muted_member(channel: &Channel, user_id: Option<&str>) -> bool
 }
 
 pub fn can_access_channel(channel: &Channel, user_id: Option<&str>) -> bool {
-    is_channel_member(channel, user_id) && !is_channel_banned(channel, user_id)
+    !channel.is_deleting
+        && is_channel_member(channel, user_id)
+        && !is_channel_banned(channel, user_id)
+}
+
+pub async fn channel_read_state_user_ids(
+    db: &Database,
+    channel_id: ObjectId,
+) -> mongodb::error::Result<Vec<String>> {
+    let states: Vec<ChannelReadState> = ChannelReadState::collection(db)
+        .find(doc! { "channelId": channel_id })
+        .await?
+        .try_collect()
+        .await?;
+    Ok(states
+        .into_iter()
+        .map(|state| state.user_id.to_hex())
+        .collect())
 }
 
 pub fn is_channel_chat_locked_for_sender(channel: &Channel, sender_id: &str) -> bool {
@@ -87,7 +111,14 @@ pub async fn serialize_channel_list_item(
     let is_muted = match User::find_by_id(db, viewer_id).await {
         Ok(Some(u)) => u.muted_channels.iter().any(|id| Some(*id) == channel.id),
         Ok(None) => return None,
-        Err(_) => return None,
+        Err(error) => {
+            log::error!(
+                "Failed to load viewer {} while serializing channel {}: {error}",
+                viewer_id.to_hex(),
+                channel.id.map(|id| id.to_hex()).unwrap_or_default()
+            );
+            return None;
+        }
     };
     let (unread, last) = enrich_channel_unread(db, viewer_id, channel).await?;
 
@@ -150,14 +181,22 @@ pub async fn fetch_users_map_slim(db: &Database, ids: &[ObjectId]) -> HashMap<Ob
         return out;
     }
 
-    let users: Vec<User> = match User::collection(db)
+    let users_result = match User::collection(db)
         .find(doc! { "_id": { "$in": &unique } })
         .await
     {
-        Ok(cursor) => cursor.try_collect().await.unwrap_or_default(),
-        Err(_) => {
+        Ok(cursor) => match cursor.try_collect::<Vec<User>>().await {
+            Ok(users) => Ok(users),
+            Err(error) => Err(format!("decode channel list users: {error}")),
+        },
+        Err(error) => Err(format!("query channel list users: {error}")),
+    };
+    let users = match users_result {
+        Ok(users) => users,
+        Err(error) => {
+            log::error!("{error}");
             for id in unique {
-                out.insert(id, json!({ "_id": id.to_hex() }));
+                out.insert(id, json!({ "_id": id.to_hex(), "unavailable": true }));
             }
             return out;
         }
@@ -180,7 +219,11 @@ pub async fn fetch_users_map_slim(db: &Database, ids: &[ObjectId]) -> HashMap<Ob
 pub async fn populate_channel_user(db: &Database, id: ObjectId) -> Value {
     match User::find_by_id(db, id).await {
         Ok(Some(u)) => user_to_channel_json(&u),
-        _ => json!({ "_id": id.to_hex() }),
+        Ok(None) => json!({ "_id": id.to_hex() }),
+        Err(error) => {
+            log::error!("Failed to load channel user {}: {error}", id.to_hex());
+            json!({ "_id": id.to_hex(), "unavailable": true })
+        }
     }
 }
 
@@ -192,14 +235,22 @@ pub async fn fetch_users_map(db: &Database, ids: &[ObjectId]) -> HashMap<ObjectI
         return out;
     }
 
-    let users: Vec<User> = match User::collection(db)
+    let users_result = match User::collection(db)
         .find(doc! { "_id": { "$in": &unique } })
         .await
     {
-        Ok(cursor) => cursor.try_collect().await.unwrap_or_default(),
-        Err(_) => {
+        Ok(cursor) => match cursor.try_collect::<Vec<User>>().await {
+            Ok(users) => Ok(users),
+            Err(error) => Err(format!("decode channel users: {error}")),
+        },
+        Err(error) => Err(format!("query channel users: {error}")),
+    };
+    let users = match users_result {
+        Ok(users) => users,
+        Err(error) => {
+            log::error!("{error}");
             for id in unique {
-                out.insert(id, json!({ "_id": id.to_hex() }));
+                out.insert(id, json!({ "_id": id.to_hex(), "unavailable": true }));
             }
             return out;
         }
@@ -228,7 +279,11 @@ pub async fn fetch_users_by_refs(db: &Database, ids: &[ObjectId]) -> Vec<Value> 
     let map = fetch_users_map(db, &unique).await;
     unique
         .into_iter()
-        .map(|id| map.get(&id).cloned().unwrap_or_else(|| json!({ "_id": id.to_hex() })))
+        .map(|id| {
+            map.get(&id)
+                .cloned()
+                .unwrap_or_else(|| json!({ "_id": id.to_hex() }))
+        })
         .collect()
 }
 
@@ -270,48 +325,80 @@ pub async fn enrich_channel_unread(
                         m.id.map(|id| (m.timestamp, content, id))
                     }
                     Ok(None) => None,
-                    Err(_) => return None,
+                    Err(error) => {
+                        log::error!(
+                            "Failed to read latest message for channel {}: {error}",
+                            channel_id.to_hex()
+                        );
+                        return None;
+                    }
                 },
-                Err(_) => return None,
+                Err(error) => {
+                    log::error!(
+                        "Failed to query latest message for channel {}: {error}",
+                        channel_id.to_hex()
+                    );
+                    return None;
+                }
             }
         }
     };
 
     let state = match ChannelReadState::find(db, user_id, channel_id).await {
         Ok(s) => s,
-        Err(_) => return None,
+        Err(error) => {
+            log::error!(
+                "Failed to load read state for user {} in channel {}: {error}",
+                user_id.to_hex(),
+                channel_id.to_hex()
+            );
+            return None;
+        }
     };
 
     let unread = if let Some(ref s) = state {
-
         let effective = if s.last_read_at.timestamp_millis() <= 0 {
             s.created_at
         } else {
             s.last_read_at
         };
         let tip_ts = tip.as_ref().map(|(ts, _, _)| *ts);
-        let behind_tip = tip_ts
-            .is_some_and(|ts| effective.timestamp_millis() < ts.timestamp_millis());
+        let behind_tip =
+            tip_ts.is_some_and(|ts| effective.timestamp_millis() < ts.timestamp_millis());
         let stale_high = s.unread_count > 0
             && tip_ts.is_some_and(|ts| effective.timestamp_millis() >= ts.timestamp_millis());
 
         if s.unread_count > 0 && !stale_high && !behind_tip {
             s.unread_count
         } else if s.unread_count == 0 && !behind_tip && tip.is_none() {
-
             0
         } else {
-
             match crate::utils::unread::try_count_channel_unread(db, user_id, channel_id).await {
                 Some(n) => n,
                 None if s.unread_count > 0 => s.unread_count,
-                None => return None,
+                None => {
+                    log::error!(
+                        "Failed to calculate unread count for user {} in channel {}",
+                        user_id.to_hex(),
+                        channel_id.to_hex()
+                    );
+                    return None;
+                }
             }
         }
     } else if tip.is_some() {
-        return None;
+        match crate::utils::unread::try_count_channel_unread(db, user_id, channel_id).await {
+            Some(count) => count,
+            None => {
+                log::error!(
+                    "Failed to calculate unread count for user {} in channel {} without a read state",
+                    user_id.to_hex(),
+                    channel_id.to_hex()
+                );
+                return None;
+            }
+        }
     } else {
-
         0
     };
 
@@ -335,7 +422,11 @@ pub async fn enrich_channels_batch(
     let mut missing_tip: Vec<ObjectId> = Vec::new();
     for ch in channels {
         let Some(id) = ch.id else { continue };
-        match (ch.last_message_at, ch.last_message.as_ref(), ch.last_message_id) {
+        match (
+            ch.last_message_at,
+            ch.last_message.as_ref(),
+            ch.last_message_id,
+        ) {
             (Some(ts), Some(preview), Some(mid)) => {
                 if let Some(entry) = out.get_mut(&id) {
                     entry.1 = Some((ts, preview.clone(), mid));
@@ -369,7 +460,9 @@ pub async fn enrich_channels_batch(
                 loop {
                     match cursor.try_next().await {
                         Ok(Some(doc)) => {
-                            let Ok(cid) = doc.get_object_id("_id") else { continue };
+                            let Ok(cid) = doc.get_object_id("_id") else {
+                                continue;
+                            };
                             let ts = doc.get_datetime("timestamp").ok().copied();
                             let content = doc
                                 .get_str("content")
@@ -381,7 +474,10 @@ pub async fn enrich_channels_batch(
                             }
                         }
                         Ok(None) => break,
-                        Err(_) => return None,
+                        Err(error) => {
+                            log::error!("Failed to read latest channel messages: {error}");
+                            return None;
+                        }
                     }
                 }
                 for (cid, tip) in filled {
@@ -390,7 +486,10 @@ pub async fn enrich_channels_batch(
                     }
                 }
             }
-            Err(_) => return None,
+            Err(error) => {
+                log::error!("Failed to query latest channel messages: {error}");
+                return None;
+            }
         }
     }
 
@@ -403,19 +502,23 @@ pub async fn enrich_channels_batch(
         Ok(cursor) => {
             let states: Vec<ChannelReadState> = match cursor.try_collect().await {
                 Ok(s) => s,
-                Err(_) => return None,
+                Err(error) => {
+                    log::error!("Failed to decode channel read states: {error}");
+                    return None;
+                }
             };
             for s in states {
-
                 let effective = if s.last_read_at.timestamp_millis() <= 0 {
                     s.created_at
                 } else {
                     s.last_read_at
                 };
                 last_reads.insert(s.channel_id, effective);
-                let tip_ts = out.get(&s.channel_id).and_then(|e| e.1.as_ref().map(|t| t.0));
-                let behind_tip = tip_ts
-                    .is_some_and(|ts| effective.timestamp_millis() < ts.timestamp_millis());
+                let tip_ts = out
+                    .get(&s.channel_id)
+                    .and_then(|e| e.1.as_ref().map(|t| t.0));
+                let behind_tip =
+                    tip_ts.is_some_and(|ts| effective.timestamp_millis() < ts.timestamp_millis());
 
                 if s.unread_count > 0 {
                     let stale_high = tip_ts
@@ -434,11 +537,12 @@ pub async fn enrich_channels_batch(
                     continue;
                 }
                 if out.get(cid).and_then(|e| e.1.as_ref()).is_some() {
-                    return None;
+                    missing_unread.push(*cid);
                 }
             }
         }
-        Err(_) => {
+        Err(error) => {
+            log::error!("Failed to query channel read states: {error}");
             return None;
         }
     }
@@ -471,33 +575,76 @@ pub async fn enrich_channels_batch(
             },
         ];
         match Message::collection(db).aggregate(unread_pipeline).await {
-            Ok(mut cursor) => {
-                loop {
-                    match cursor.try_next().await {
-                        Ok(Some(doc)) => {
-                            let Ok(cid) = doc.get_object_id("_id") else { continue };
-                            let count = match doc.get("count") {
-                                Some(mongodb::bson::Bson::Int64(n)) => (*n).max(0) as u64,
-                                Some(mongodb::bson::Bson::Int32(n)) => (*n).max(0) as u64,
-                                _ => 0,
-                            };
-                            if let Some(entry) = out.get_mut(&cid) {
-                                entry.0 = count;
-                            }
-                        }
-                        Ok(None) => break,
-                        Err(_) => {
-
-                            return None;
+            Ok(mut cursor) => loop {
+                match cursor.try_next().await {
+                    Ok(Some(doc)) => {
+                        let Ok(cid) = doc.get_object_id("_id") else {
+                            continue;
+                        };
+                        let count = match doc.get("count") {
+                            Some(mongodb::bson::Bson::Int64(n)) => (*n).max(0) as u64,
+                            Some(mongodb::bson::Bson::Int32(n)) => (*n).max(0) as u64,
+                            _ => 0,
+                        };
+                        if let Some(entry) = out.get_mut(&cid) {
+                            entry.0 = count;
                         }
                     }
+                    Ok(None) => break,
+                    Err(error) => {
+                        log::error!("Failed to read channel unread aggregation: {error}");
+                        return None;
+                    }
                 }
-            }
-            Err(_) => {
+            },
+            Err(error) => {
+                log::error!("Failed to aggregate channel unread counts: {error}");
                 return None;
             }
         }
     }
 
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use mongodb::bson::{doc, oid::ObjectId, DateTime};
+
+    use crate::model::channels::Channel;
+
+    use super::{can_access_channel, is_channel_member};
+
+    fn channel_document(is_deleting: Option<bool>) -> Channel {
+        let admin = ObjectId::new();
+        let mut document = doc! {
+            "name": "test",
+            "admin": admin,
+            "members": [],
+            "createdAt": DateTime::now(),
+            "updatedAt": DateTime::now(),
+        };
+        if let Some(is_deleting) = is_deleting {
+            document.insert("isDeleting", is_deleting);
+        }
+        mongodb::bson::from_document(document).unwrap()
+    }
+
+    #[test]
+    fn deleting_channel_is_not_accessible() {
+        let channel = channel_document(Some(true));
+        let admin_id = channel.admin.to_hex();
+
+        assert!(!is_channel_member(&channel, Some(&admin_id)));
+        assert!(!can_access_channel(&channel, Some(&admin_id)));
+    }
+
+    #[test]
+    fn channels_without_deletion_flag_remain_accessible() {
+        let channel = channel_document(None);
+        let admin_id = channel.admin.to_hex();
+
+        assert!(is_channel_member(&channel, Some(&admin_id)));
+        assert!(can_access_channel(&channel, Some(&admin_id)));
+    }
 }

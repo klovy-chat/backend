@@ -16,19 +16,17 @@ use serde_json::json;
 use crate::middlewares::auth::RequestUserId;
 use crate::model::refresh_tokens::RefreshToken;
 use crate::model::storage_cleanup::{PendingStorageDeletion, StorageObjectKind};
-use crate::model::users::{CreateUserInput, User, normalize_language};
+use crate::model::users::{normalize_language, CreateUserInput, User};
 use crate::model::warnings::{severity_str, Warning};
 use crate::routes::auth::{ProfileBannerForm, ProfileImageForm};
-use crate::utils::auth::tokens::{create_access_token, ACCESS_MAX_AGE_MS, REFRESH_MAX_AGE_MS};
+use crate::utils::auth::metadata::session_metadata_from_request;
 use crate::utils::auth::refresh::{
     family_id_from_refresh_token, issue_refresh_token, list_user_sessions,
     revoke_other_sessions_for_user, revoke_refresh_token_family, revoke_session_for_user,
     revoke_user_refresh_tokens, rotate_refresh_token, RefreshAuthError, REFRESH_COOKIE,
 };
-use crate::utils::auth::metadata::session_metadata_from_request;
-use crate::utils::auth::step_up::{
-    backup_codes_bson_after_consumption, verify_step_up_auth, StepUpResult,
-};
+use crate::utils::auth::step_up::{consume_backup_code, verify_step_up_auth, StepUpResult};
+use crate::utils::auth::tokens::{create_access_token, ACCESS_MAX_AGE_MS, REFRESH_MAX_AGE_MS};
 use crate::utils::auth::totp::{
     build_otpauth_url, decrypt_totp_secret, encrypt_totp_secret, generate_backup_codes,
     generate_totp_secret, hash_backup_codes, is_totp_code, verify_and_consume_backup_code,
@@ -38,28 +36,31 @@ use crate::utils::auth::two_factor::{
     create_two_factor_challenge_token, decode_two_factor_challenge_token,
 };
 use crate::utils::crypto::passwords::verify_user_password;
-use crate::ws::registry::{disconnect_user, revoke_session_remotely};
-use crate::utils::friends::emit_profile_event;
 use crate::utils::db::get_db;
-use crate::utils::user::json::{resolve_display_name, serialize_user, BIO_MAX_LENGTH, DISPLAY_NAME_MAX_LENGTH};
+use crate::utils::friends::emit_profile_event;
+use crate::utils::registration::{is_registration_open, try_consume_global_signup_slot};
+use crate::utils::security::csrf::{
+    build_csrf_cookie, clear_csrf_cookie, csrf_token_for_response, generate_csrf_token,
+};
+use crate::utils::security::monitor::{SecurityEventType, SecurityMonitor};
 use crate::utils::upload::{
-    file_bytes_within_limit, local_file_size, MAX_AVATAR_BYTES, MAX_BANNER_BYTES,
-    MAX_BANNER_EDGE,
+    file_bytes_within_limit, local_file_size, MAX_AVATAR_BYTES, MAX_BANNER_BYTES, MAX_BANNER_EDGE,
+};
+use crate::utils::user::json::{
+    resolve_display_name, serialize_user, BIO_MAX_LENGTH, DISPLAY_NAME_MAX_LENGTH,
 };
 use crate::utils::validators::file_type::validate_file_magic_async;
-use crate::utils::validators::username::{is_valid_username, looks_like_email, normalize_username};
 use crate::utils::validators::leaked_password::{check_password_breach, PasswordBreachCheck};
-use crate::utils::security::csrf::{build_csrf_cookie, clear_csrf_cookie, csrf_token_for_response, generate_csrf_token};
-use crate::utils::security::monitor::{SecurityEventType, SecurityMonitor};
-use crate::utils::registration::{is_registration_open, try_consume_global_signup_slot};
+use crate::utils::validators::username::{is_valid_username, looks_like_email, normalize_username};
+use crate::ws::registry::{disconnect_user, revoke_session_remotely};
 
-use crate::utils::env::is_production;
 use crate::utils::admin::DELETION_GRACE_DAYS;
+use crate::utils::env::is_production;
 use crate::utils::images::{
     reencode_error_message, reencode_upload_to_webp_async, reencode_upload_to_webp_max_edge_async,
 };
 use crate::utils::storage::{
-    avatar_user_key, avatar_key_owned_by_user, banner_user_key, public_media_key_owned_by_user,
+    avatar_key_owned_by_user, avatar_user_key, banner_user_key, public_media_key_owned_by_user,
     storage,
 };
 
@@ -140,11 +141,16 @@ async fn revoke_other_devices(req: &HttpRequest, user_id: ObjectId) {
         _ => return,
     };
     let db = get_db();
-    let other_families =
-        match RefreshToken::active_family_ids_for_user_except(&db, user_id, &current_family).await {
-            Ok(families) => families,
-            Err(_) => return,
-        };
+    let other_families = match RefreshToken::active_family_ids_for_user_except(
+        &db,
+        user_id,
+        &current_family,
+    )
+    .await
+    {
+        Ok(families) => families,
+        Err(_) => return,
+    };
     if revoke_other_sessions_for_user(user_id, &current_family)
         .await
         .is_err()
@@ -245,9 +251,8 @@ async fn verify_account_action_credentials(
     password: &str,
     code: Option<&str>,
     db: &mongodb::Database,
-    user_id: ObjectId,
 ) -> Result<(), HttpResponse> {
-    if password.is_empty() {
+    if password.trim().is_empty() {
         return Err(HttpResponse::BadRequest().json(json!({
             "message": "Hasło jest wymagane."
         })));
@@ -264,20 +269,12 @@ async fn verify_account_action_credentials(
         Err(res) => return Err(res),
     }
 
-    match verify_step_up_auth(user, code).await {
+    match verify_step_up_auth(db, user, code).await {
         Err(message) => {
             add_login_delay().await;
             Err(step_up_err_response(message))
         }
-        Ok(StepUpResult::BackupConsumed { index }) => {
-            let codes_bson = backup_codes_bson_after_consumption(user, index);
-            if let Err(e) = User::set_fields(db, user_id, doc! { "backupCodes": codes_bson }).await {
-                log::error!("Failed to update backup codes after step-up: {e}");
-                Err(HttpResponse::InternalServerError().body("Internal Server Error"))
-            } else {
-                Ok(())
-            }
-        }
+        Ok(StepUpResult::BackupConsumed) => Ok(()),
         Ok(StepUpResult::NotRequired) | Ok(StepUpResult::Verified) => Ok(()),
     }
 }
@@ -293,17 +290,11 @@ async fn login_response(req: &HttpRequest, user: User) -> HttpResponse {
         Ok(r) => r,
         Err(_) => return HttpResponse::InternalServerError().body("Internal Server Error"),
     };
-    let token = match create_access_token(
-        &db,
-        &user.username,
-        &user_id,
-        Some(&refresh.family_id),
-    )
-    .await
-    {
-        Ok(t) => t,
-        Err(_) => return HttpResponse::InternalServerError().body("Internal Server Error"),
-    };
+    let token =
+        match create_access_token(&db, &user.username, &user_id, Some(&refresh.family_id)).await {
+            Ok(t) => t,
+            Err(_) => return HttpResponse::InternalServerError().body("Internal Server Error"),
+        };
 
     let csrf = generate_csrf_token();
     HttpResponse::Ok()
@@ -339,8 +330,7 @@ fn account_status_response(user: &User) -> Option<HttpResponse> {
             .filter(|r| !r.is_empty())
             .unwrap_or("Konto zostało zbanowane za naruszenie regulaminu.");
         return Some(
-            HttpResponse::Forbidden()
-                .json(json!({ "message": message, "code": "ACCOUNT_BANNED" })),
+            HttpResponse::Forbidden().json(json!({ "message": message, "code": "ACCOUNT_BANNED" })),
         );
     }
 
@@ -417,7 +407,7 @@ pub async fn signup(
     let normalized = normalize_username(raw_username);
     let password = body.password.clone().unwrap_or_default();
 
-    if normalized.is_empty() || password.is_empty() {
+    if normalized.is_empty() || password.trim().is_empty() {
         return HttpResponse::BadRequest()
             .json(json!({ "message": "Username and password are required" }));
     }
@@ -494,29 +484,24 @@ pub async fn signup(
     )
     .await
     {
-        Ok(user) => {
-            HttpResponse::Created().json(json!({
-                "message": "Konto utworzone. Możesz się zalogować.",
-                "user": serialize_user(&user),
-            }))
-        }
-        Err(e) => {
-            match User::username_exists(&db, &normalized).await {
-                Ok(_) => {
-
-                    add_login_delay().await;
-                    HttpResponse::BadRequest().json(json!({
+        Ok(user) => HttpResponse::Created().json(json!({
+            "message": "Konto utworzone. Możesz się zalogować.",
+            "user": serialize_user(&user),
+        })),
+        Err(e) => match User::username_exists(&db, &normalized).await {
+            Ok(_) => {
+                add_login_delay().await;
+                HttpResponse::BadRequest().json(json!({
                         "message": "Nie można utworzyć konta. Sprawdź dane lub wybierz inną nazwę użytkownika."
                     }))
-                }
-                Err(_) => {
-                    log::error!("signup failed (username lookup unavailable): {e}");
-                    HttpResponse::ServiceUnavailable().json(json!({
-                        "message": "Temporarily unavailable. Retry."
-                    }))
-                }
             }
-        }
+            Err(_) => {
+                log::error!("signup failed (username lookup unavailable): {e}");
+                HttpResponse::ServiceUnavailable().json(json!({
+                    "message": "Temporarily unavailable. Retry."
+                }))
+            }
+        },
     }
 }
 
@@ -546,7 +531,7 @@ pub async fn login(
     let normalized = normalize_username(raw_username);
     let password = body.password.clone().unwrap_or_default();
 
-    if normalized.is_empty() || password.is_empty() {
+    if normalized.is_empty() || password.trim().is_empty() {
         add_login_delay().await;
         return HttpResponse::BadRequest()
             .json(json!({ "message": "Username and password are required" }));
@@ -603,13 +588,17 @@ pub async fn login(
     login_response(&req, user).await
 }
 
-pub async fn verify_two_factor_login(req: HttpRequest, body: web::Json<TwoFactorLoginBody>) -> HttpResponse {
+pub async fn verify_two_factor_login(
+    req: HttpRequest,
+    body: web::Json<TwoFactorLoginBody>,
+) -> HttpResponse {
     let token = body.two_factor.as_deref().unwrap_or("").trim();
     let code = body.code.as_deref().unwrap_or("").trim();
 
     if token.is_empty() || code.is_empty() {
         add_login_delay().await;
-        return HttpResponse::BadRequest().json(json!({ "message": "Two-factor token and code are required." }));
+        return HttpResponse::BadRequest()
+            .json(json!({ "message": "Two-factor token and code are required." }));
     }
 
     let payload = match decode_two_factor_challenge_token(token) {
@@ -630,14 +619,16 @@ pub async fn verify_two_factor_login(req: HttpRequest, body: web::Json<TwoFactor
         Ok(Some(u)) => u,
         Ok(None) => {
             add_login_delay().await;
-            return HttpResponse::BadRequest().json(json!({ "message": "Invalid two-factor token." }));
+            return HttpResponse::BadRequest()
+                .json(json!({ "message": "Invalid two-factor token." }));
         }
         Err(_) => return HttpResponse::InternalServerError().body("Internal Server Error"),
     };
 
     if !user.two_factor_enabled {
         add_login_delay().await;
-        return HttpResponse::BadRequest().json(json!({ "message": "Two-factor authentication is not enabled." }));
+        return HttpResponse::BadRequest()
+            .json(json!({ "message": "Two-factor authentication is not enabled." }));
     }
 
     if let Some(response) = account_status_response(&user) {
@@ -646,21 +637,18 @@ pub async fn verify_two_factor_login(req: HttpRequest, body: web::Json<TwoFactor
     }
 
     let mut verified = false;
-    let mut updated_backup_codes = user.backup_codes.clone();
 
     if is_totp_code(code) {
         if let Some(encrypted) = user.totp_secret.as_deref() {
             match decrypt_totp_secret(encrypted) {
-                Ok(secret) => {
-                    match verify_totp_code(&user.username, &secret, code) {
-                        Ok(v) => verified = v,
-                        Err(()) => {
-                            return HttpResponse::ServiceUnavailable().json(json!({
-                                "message": "Temporarily unavailable. Retry."
-                            }));
-                        }
+                Ok(secret) => match verify_totp_code(&user.username, &secret, code) {
+                    Ok(v) => verified = v,
+                    Err(()) => {
+                        return HttpResponse::ServiceUnavailable().json(json!({
+                            "message": "Temporarily unavailable. Retry."
+                        }));
                     }
-                }
+                },
                 Err(_) => {
                     return HttpResponse::ServiceUnavailable().json(json!({
                         "message": "Temporarily unavailable. Retry."
@@ -670,12 +658,16 @@ pub async fn verify_two_factor_login(req: HttpRequest, body: web::Json<TwoFactor
         }
     } else if let Some(hashes) = user.backup_codes.as_ref() {
         match verify_and_consume_backup_code(code, hashes).await {
-            Ok(Some(index)) => {
-                verified = true;
-                if let Some(codes) = updated_backup_codes.as_mut() {
-                    codes.remove(index);
+            Ok(Some(index)) => match consume_backup_code(&db, &user, index).await {
+                Ok(true) => verified = true,
+                Ok(false) => {}
+                Err(error) => {
+                    log::error!("Failed to atomically consume login backup code: {error}");
+                    return HttpResponse::ServiceUnavailable().json(json!({
+                        "message": "Temporarily unavailable. Retry."
+                    }));
                 }
-            }
+            },
             Ok(None) => {}
             Err(()) => {
                 return HttpResponse::ServiceUnavailable().json(json!({
@@ -687,30 +679,8 @@ pub async fn verify_two_factor_login(req: HttpRequest, body: web::Json<TwoFactor
 
     if !verified {
         add_login_delay().await;
-        return HttpResponse::BadRequest().json(json!({ "message": "Invalid authentication code." }));
-    }
-
-    if updated_backup_codes != user.backup_codes {
-        let backup_val = match updated_backup_codes {
-            Some(codes) if !codes.is_empty() => {
-                Bson::Array(codes.into_iter().map(Bson::String).collect())
-            }
-            _ => Bson::Null,
-        };
-
-        match User::set_fields(&db, user_oid, doc! { "backupCodes": backup_val }).await {
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                return HttpResponse::NotFound()
-                    .json(json!({ "message": "User not found." }));
-            }
-            Err(_) => {
-
-                return HttpResponse::ServiceUnavailable().json(json!({
-                    "message": "Temporarily unavailable. Retry."
-                }));
-            }
-        }
+        return HttpResponse::BadRequest()
+            .json(json!({ "message": "Invalid authentication code." }));
     }
 
     login_response(&req, user).await
@@ -727,8 +697,8 @@ pub async fn setup_two_factor(
         return HttpResponse::NotFound().body("User not found.");
     };
 
-    let password = body.password.as_deref().unwrap_or("").trim();
-    if password.is_empty() {
+    let password = body.password.as_deref().unwrap_or("");
+    if password.trim().is_empty() {
         return HttpResponse::BadRequest().json(json!({
             "message": "Password is required to start two-factor setup."
         }));
@@ -784,8 +754,8 @@ pub async fn enable_two_factor(
     };
 
     let code = body.code.as_deref().unwrap_or("").trim();
-    let password = body.password.as_deref().unwrap_or("").trim();
-    if code.is_empty() || password.is_empty() {
+    let password = body.password.as_deref().unwrap_or("");
+    if code.is_empty() || password.trim().is_empty() {
         return HttpResponse::BadRequest().json(json!({
             "message": "Password and authentication code are required."
         }));
@@ -832,7 +802,8 @@ pub async fn enable_two_factor(
         Ok(true) => {}
         Ok(false) => {
             add_login_delay().await;
-            return HttpResponse::BadRequest().json(json!({ "message": "Invalid authentication code." }));
+            return HttpResponse::BadRequest()
+                .json(json!({ "message": "Invalid authentication code." }));
         }
         Err(()) => {
             return HttpResponse::ServiceUnavailable().json(json!({
@@ -868,10 +839,11 @@ pub async fn enable_two_factor(
         Ok(Some(updated)) => {
             revoke_other_devices(&req, oid).await;
             HttpResponse::Ok().json(json!({
-            "message": "Two-factor authentication enabled.",
-            "twoFactorEnabled": updated.two_factor_enabled,
-            "backupCodes": plain_codes,
-        }))},
+                "message": "Two-factor authentication enabled.",
+                "twoFactorEnabled": updated.two_factor_enabled,
+                "backupCodes": plain_codes,
+            }))
+        }
         Ok(None) => HttpResponse::NotFound().body("User not found."),
         Err(_) => HttpResponse::InternalServerError().body("Internal Server Error"),
     }
@@ -891,7 +863,7 @@ pub async fn disable_two_factor(
     let password = body.password.as_deref().unwrap_or("");
     let code = body.code.as_deref().unwrap_or("").trim();
 
-    if password.is_empty() || code.is_empty() {
+    if password.trim().is_empty() || code.is_empty() {
         return HttpResponse::BadRequest().json(json!({
             "message": "Password and authentication code are required."
         }));
@@ -923,16 +895,14 @@ pub async fn disable_two_factor(
     if is_totp_code(code) {
         if let Some(encrypted) = user.totp_secret.as_deref() {
             match decrypt_totp_secret(encrypted) {
-                Ok(secret) => {
-                    match verify_totp_code(&user.username, &secret, code) {
-                        Ok(v) => verified = v,
-                        Err(()) => {
-                            return HttpResponse::ServiceUnavailable().json(json!({
-                                "message": "Temporarily unavailable. Retry."
-                            }));
-                        }
+                Ok(secret) => match verify_totp_code(&user.username, &secret, code) {
+                    Ok(v) => verified = v,
+                    Err(()) => {
+                        return HttpResponse::ServiceUnavailable().json(json!({
+                            "message": "Temporarily unavailable. Retry."
+                        }));
                     }
-                }
+                },
                 Err(_) => {
                     return HttpResponse::ServiceUnavailable().json(json!({
                         "message": "Temporarily unavailable. Retry."
@@ -942,7 +912,16 @@ pub async fn disable_two_factor(
         }
     } else if let Some(hashes) = user.backup_codes.as_ref() {
         match verify_and_consume_backup_code(code, hashes).await {
-            Ok(Some(_)) => verified = true,
+            Ok(Some(index)) => match consume_backup_code(&db, &user, index).await {
+                Ok(true) => verified = true,
+                Ok(false) => {}
+                Err(error) => {
+                    log::error!("Failed to atomically consume 2FA-disable backup code: {error}");
+                    return HttpResponse::ServiceUnavailable().json(json!({
+                        "message": "Temporarily unavailable. Retry."
+                    }));
+                }
+            },
             Ok(None) => {}
             Err(()) => {
                 return HttpResponse::ServiceUnavailable().json(json!({
@@ -954,7 +933,8 @@ pub async fn disable_two_factor(
 
     if !verified {
         add_login_delay().await;
-        return HttpResponse::BadRequest().json(json!({ "message": "Invalid authentication code." }));
+        return HttpResponse::BadRequest()
+            .json(json!({ "message": "Invalid authentication code." }));
     }
 
     match User::set_fields(
@@ -972,9 +952,10 @@ pub async fn disable_two_factor(
         Ok(Some(updated)) => {
             revoke_other_devices(&req, oid).await;
             HttpResponse::Ok().json(json!({
-            "message": "Two-factor authentication disabled.",
-            "twoFactorEnabled": updated.two_factor_enabled,
-        }))},
+                "message": "Two-factor authentication disabled.",
+                "twoFactorEnabled": updated.two_factor_enabled,
+            }))
+        }
         Ok(None) => HttpResponse::NotFound().body("User not found."),
         Err(_) => HttpResponse::InternalServerError().body("Internal Server Error"),
     }
@@ -991,10 +972,10 @@ pub async fn change_password(
         return HttpResponse::NotFound().body("User not found.");
     };
 
-    let current = body.current_password.as_deref().unwrap_or("").trim();
-    let new_password = body.new_password.as_deref().unwrap_or("").trim();
+    let current = body.current_password.as_deref().unwrap_or("");
+    let new_password = body.new_password.as_deref().unwrap_or("");
 
-    if current.is_empty() || new_password.is_empty() {
+    if current.trim().is_empty() || new_password.trim().is_empty() {
         return HttpResponse::BadRequest().json(json!({
             "message": "Current password and new password are required."
         }));
@@ -1024,18 +1005,12 @@ pub async fn change_password(
         Err(res) => return res,
     }
 
-    match verify_step_up_auth(&user, body.code.as_deref()).await {
+    match verify_step_up_auth(&db, &user, body.code.as_deref()).await {
         Err(message) => {
             add_login_delay().await;
             return step_up_err_response(message);
         }
-        Ok(StepUpResult::BackupConsumed { index }) => {
-            let codes_bson = backup_codes_bson_after_consumption(&user, index);
-            if let Err(e) = User::set_fields(&db, oid, doc! { "backupCodes": codes_bson }).await {
-                log::error!("Failed to update backup codes after step-up: {e}");
-                return HttpResponse::InternalServerError().body("Internal Server Error");
-            }
-        }
+        Ok(StepUpResult::BackupConsumed) => {}
         Ok(StepUpResult::NotRequired) | Ok(StepUpResult::Verified) => {}
     }
 
@@ -1083,7 +1058,7 @@ pub async fn change_username(
     let normalized = normalize_username(body.username.as_deref().unwrap_or(""));
     let password = body.password.as_deref().unwrap_or("");
 
-    if password.is_empty() {
+    if password.trim().is_empty() {
         return HttpResponse::BadRequest().json(json!({
             "message": "Podaj aktualne hasło, aby zmienić nazwę użytkownika."
         }));
@@ -1117,18 +1092,12 @@ pub async fn change_username(
         }));
     }
 
-    match verify_step_up_auth(&user, body.code.as_deref()).await {
+    match verify_step_up_auth(&db, &user, body.code.as_deref()).await {
         Err(message) => {
             add_login_delay().await;
             return step_up_err_response(message);
         }
-        Ok(StepUpResult::BackupConsumed { index }) => {
-            let codes_bson = backup_codes_bson_after_consumption(&user, index);
-            if let Err(e) = User::set_fields(&db, oid, doc! { "backupCodes": codes_bson }).await {
-                log::error!("Failed to update backup codes after step-up: {e}");
-                return HttpResponse::InternalServerError().body("Internal Server Error");
-            }
-        }
+        Ok(StepUpResult::BackupConsumed) => {}
         Ok(StepUpResult::NotRequired) | Ok(StepUpResult::Verified) => {}
     }
 
@@ -1160,18 +1129,15 @@ pub async fn change_username(
             HttpResponse::Ok().json(serialize_user(&user))
         }
         Ok(None) => HttpResponse::NotFound().body("User not found."),
-        Err(_) => {
-
-            match User::username_taken_by_other(&db, &normalized, oid).await {
-                Ok(true) => HttpResponse::Conflict().json(json!({
-                    "message": "Ta nazwa użytkownika jest już zajęta. Wybierz inną."
-                })),
-                Ok(false) => HttpResponse::InternalServerError().body("Internal Server Error."),
-                Err(_) => HttpResponse::ServiceUnavailable().json(json!({
-                    "message": "Temporarily unavailable. Retry."
-                })),
-            }
-        }
+        Err(_) => match User::username_taken_by_other(&db, &normalized, oid).await {
+            Ok(true) => HttpResponse::Conflict().json(json!({
+                "message": "Ta nazwa użytkownika jest już zajęta. Wybierz inną."
+            })),
+            Ok(false) => HttpResponse::InternalServerError().body("Internal Server Error."),
+            Err(_) => HttpResponse::ServiceUnavailable().json(json!({
+                "message": "Temporarily unavailable. Retry."
+            })),
+        },
     }
 }
 
@@ -1183,23 +1149,9 @@ pub async fn refresh_session(req: HttpRequest) -> HttpResponse {
 
     match rotate_refresh_token(&refresh_token, session_metadata_from_request(&req)).await {
         Ok(session) => {
-            let user_id = session.user.id.map(|o| o.to_hex()).unwrap_or_default();
-            let db = get_db();
-            let access = match create_access_token(
-                &db,
-                &session.user.username,
-                &user_id,
-                Some(&session.family_id),
-            )
-            .await
-            {
-                Ok(t) => t,
-                Err(_) => return HttpResponse::InternalServerError().body("Internal Server Error"),
-            };
-
             let csrf = generate_csrf_token();
             HttpResponse::Ok()
-                .cookie(jwt_cookie(&access, ACCESS_MAX_AGE_MS))
+                .cookie(jwt_cookie(&session.access_token, ACCESS_MAX_AGE_MS))
                 .cookie(refresh_cookie(
                     &session.new_refresh_token,
                     REFRESH_MAX_AGE_MS,
@@ -1254,7 +1206,12 @@ pub async fn logout(req: HttpRequest) -> HttpResponse {
                     }
                 }
             }
-            Err(RefreshAuthError::Unavailable) | Err(RefreshAuthError::Denied) => {
+            Err(RefreshAuthError::Unavailable) => {
+                return HttpResponse::ServiceUnavailable().json(json!({
+                    "message": "Temporarily unavailable. Retry."
+                }));
+            }
+            Err(RefreshAuthError::Denied) => {
                 if let Some(user_id) = user_id.clone() {
                     if let Ok(oid) = ObjectId::parse_str(&user_id) {
                         disconnect_user(&oid.to_hex());
@@ -1303,8 +1260,7 @@ pub async fn list_sessions(req: HttpRequest) -> HttpResponse {
     // device is still flagged correctly in the list.
     if current_family_id.is_none() {
         if let Some(jwt) = req.cookie("jwt") {
-            current_family_id =
-                crate::utils::auth::jwt::session_family_from_jwt(jwt.value());
+            current_family_id = crate::utils::auth::jwt::session_family_from_jwt(jwt.value());
         }
     }
 
@@ -1412,16 +1368,15 @@ pub async fn revoke_other_sessions(req: HttpRequest) -> HttpResponse {
     };
 
     let db = get_db();
-    let other_families = match RefreshToken::active_family_ids_for_user_except(&db, oid, &current_family)
-        .await
-    {
-        Ok(families) => families,
-        Err(_) => {
-            return HttpResponse::InternalServerError().json(json!({
-                "message": "Nie udało się wylogować innych sesji."
-            }));
-        }
-    };
+    let other_families =
+        match RefreshToken::active_family_ids_for_user_except(&db, oid, &current_family).await {
+            Ok(families) => families,
+            Err(_) => {
+                return HttpResponse::InternalServerError().json(json!({
+                    "message": "Nie udało się wylogować innych sesji."
+                }));
+            }
+        };
 
     match revoke_other_sessions_for_user(oid, &current_family).await {
         Ok(revoked) => {
@@ -1463,11 +1418,19 @@ pub async fn revoke_all_sessions(req: HttpRequest) -> HttpResponse {
     };
 
     if let Err(err) = User::invalidate_tokens(&db, oid).await {
-        log::warn!("Failed to invalidate token version for full logout user {}: {}", oid, err);
+        log::warn!(
+            "Failed to invalidate token version for full logout user {}: {}",
+            oid,
+            err
+        );
     }
 
     if let Err(err) = RefreshToken::revoke_all_for_user(&db, oid).await {
-        log::warn!("Failed to revoke all refresh families for user {}: {}", oid, err);
+        log::warn!(
+            "Failed to revoke all refresh families for user {}: {}",
+            oid,
+            err
+        );
         return HttpResponse::InternalServerError().json(json!({
             "message": "Nie udało się wylogować wszystkich sesji."
         }));
@@ -1513,9 +1476,7 @@ pub async fn get_user_info(req: HttpRequest) -> HttpResponse {
         obj.insert("csrfToken".to_string(), json!(csrf));
         let session_needs_refresh = req
             .cookie("jwt")
-            .map(|c| {
-                crate::utils::auth::jwt::session_family_from_jwt(c.value()).is_none()
-            })
+            .map(|c| crate::utils::auth::jwt::session_family_from_jwt(c.value()).is_none())
             .unwrap_or(false);
         obj.insert(
             "sessionNeedsRefresh".to_string(),
@@ -1602,13 +1563,13 @@ pub async fn update_profile(req: HttpRequest, body: web::Json<UpdateProfileBody>
         return HttpResponse::BadRequest().body("Display name is required.");
     }
     if trimmed_name.chars().count() > DISPLAY_NAME_MAX_LENGTH {
-        return HttpResponse::BadRequest()
-            .body(format!("Display name must be at most {DISPLAY_NAME_MAX_LENGTH} characters."));
+        return HttpResponse::BadRequest().body(format!(
+            "Display name must be at most {DISPLAY_NAME_MAX_LENGTH} characters."
+        ));
     }
 
-    let trimmed_bio = crate::utils::validators::unicode::sanitize_bio(
-        body.bio.as_deref().unwrap_or(""),
-    );
+    let trimmed_bio =
+        crate::utils::validators::unicode::sanitize_bio(body.bio.as_deref().unwrap_or(""));
     if trimmed_bio.chars().count() > BIO_MAX_LENGTH {
         return HttpResponse::BadRequest()
             .body(format!("Bio must be at most {BIO_MAX_LENGTH} characters."));
@@ -1650,7 +1611,10 @@ pub async fn update_profile(req: HttpRequest, body: web::Json<UpdateProfileBody>
     }
 }
 
-pub async fn update_language(req: HttpRequest, body: web::Json<UpdateLanguageBody>) -> HttpResponse {
+pub async fn update_language(
+    req: HttpRequest,
+    body: web::Json<UpdateLanguageBody>,
+) -> HttpResponse {
     let Some(user_id) = req_user_id(&req) else {
         return HttpResponse::BadRequest().body("User ID is required.");
     };
@@ -1719,7 +1683,7 @@ pub async fn add_profile_image(
 
     match User::set_fields(&db, oid, doc! { "image": &key }).await {
         Ok(Some(user)) => {
-            let mut cleanup_error = None;
+            let mut cleanup_pending = false;
             if let Some(image) = previous_image {
                 if image != key && avatar_key_owned_by_user(&image, &user_id) {
                     if let Err(error) = PendingStorageDeletion::delete_or_defer(
@@ -1730,7 +1694,7 @@ pub async fn add_profile_image(
                     .await
                     {
                         log::error!("Failed to schedule cleanup for previous profile image {image}: {error}");
-                        cleanup_error = Some(error);
+                        cleanup_pending = true;
                     }
                 }
             }
@@ -1744,16 +1708,77 @@ pub async fn add_profile_image(
                 }),
             )
             .await;
-            if cleanup_error.is_some() {
-                return HttpResponse::ServiceUnavailable().json(json!({
-                    "message": "Profile image updated, but old image cleanup is pending.",
-                    "retryable": true,
-                }));
-            }
-            HttpResponse::Ok().json(json!({ "image": user.image }))
+            HttpResponse::Ok().json(json!({
+                "image": user.image,
+                "cleanupPending": cleanup_pending,
+            }))
         }
-        Ok(None) => HttpResponse::NotFound().body("User not found."),
-        Err(_) => HttpResponse::InternalServerError().body("Internal Server Error."),
+        Ok(None) => {
+            if let Err(error) =
+                PendingStorageDeletion::delete_or_defer(&db, &key, StorageObjectKind::Avatar).await
+            {
+                log::error!("Failed to schedule cleanup for orphaned profile image {key}: {error}");
+            }
+            HttpResponse::NotFound().body("User not found.")
+        }
+        Err(error) => {
+            log::error!("Failed to update profile image for {user_id}: {error}");
+            match User::find_by_id(&db, oid).await {
+                Ok(Some(user)) if user.image.as_deref() == Some(key.as_str()) => {
+                    let mut cleanup_pending = false;
+                    if let Some(image) = previous_image {
+                        if image != key && avatar_key_owned_by_user(&image, &user_id) {
+                            if let Err(cleanup_error) = PendingStorageDeletion::delete_or_defer(
+                                &db,
+                                &image,
+                                StorageObjectKind::Avatar,
+                            )
+                            .await
+                            {
+                                log::error!(
+                                    "Failed to schedule cleanup for previous profile image {image}: {cleanup_error}"
+                                );
+                                cleanup_pending = true;
+                            }
+                        }
+                    }
+                    emit_profile_event(
+                        &db,
+                        &user_id,
+                        "profile-image-updated",
+                        json!({ "userId": user_id, "image": user.image }),
+                    )
+                    .await;
+                    HttpResponse::Ok().json(json!({
+                        "image": key,
+                        "cleanupPending": cleanup_pending,
+                    }))
+                }
+                Ok(_) => {
+                    if let Err(cleanup_error) = PendingStorageDeletion::delete_or_defer(
+                        &db,
+                        &key,
+                        StorageObjectKind::Avatar,
+                    )
+                    .await
+                    {
+                        log::error!(
+                            "Failed to schedule cleanup for unreferenced profile image {key}: {cleanup_error}"
+                        );
+                    }
+                    HttpResponse::InternalServerError().body("Failed to update profile image.")
+                }
+                Err(check_error) => {
+                    log::error!(
+                        "Could not verify profile image {key} after update failure: {check_error}"
+                    );
+                    HttpResponse::ServiceUnavailable().json(json!({
+                        "message": "Profile image update status is temporarily unavailable.",
+                        "retryable": true,
+                    }))
+                }
+            }
+        }
     }
 }
 
@@ -1778,7 +1803,7 @@ pub async fn remove_profile_image(req: HttpRequest) -> HttpResponse {
     if let Some(image) = &user.image {
         match User::set_fields(&db, oid, doc! { "image": Bson::Null }).await {
             Ok(Some(_)) => {
-                let mut cleanup_error = None;
+                let mut cleanup_pending = false;
                 if avatar_key_owned_by_user(image, &user_id) {
                     if let Err(error) = PendingStorageDeletion::delete_or_defer(
                         &db,
@@ -1787,8 +1812,10 @@ pub async fn remove_profile_image(req: HttpRequest) -> HttpResponse {
                     )
                     .await
                     {
-                        log::error!("Failed to schedule cleanup for removed profile image {image}: {error}");
-                        cleanup_error = Some(error);
+                        log::error!(
+                            "Failed to schedule cleanup for removed profile image {image}: {error}"
+                        );
+                        cleanup_pending = true;
                     }
                 }
                 emit_profile_event(
@@ -1801,12 +1828,10 @@ pub async fn remove_profile_image(req: HttpRequest) -> HttpResponse {
                     }),
                 )
                 .await;
-                if cleanup_error.is_some() {
-                    return HttpResponse::ServiceUnavailable().json(json!({
-                        "message": "Profile image was removed, but storage cleanup is pending.",
-                        "retryable": true,
-                    }));
-                }
+                return HttpResponse::Ok().json(json!({
+                    "message": "Profile image removed successfully",
+                    "cleanupPending": cleanup_pending,
+                }));
             }
             Ok(None) => {
                 return HttpResponse::NotFound().json(json!({ "error": "User not found" }));
@@ -1818,7 +1843,10 @@ pub async fn remove_profile_image(req: HttpRequest) -> HttpResponse {
         }
     }
 
-    HttpResponse::Ok().json(json!({ "message": "Profile image removed successfully" }))
+    HttpResponse::Ok().json(json!({
+        "message": "Profile image removed successfully",
+        "cleanupPending": false,
+    }))
 }
 
 pub async fn add_profile_banner(
@@ -1871,7 +1899,7 @@ pub async fn add_profile_banner(
 
     match User::set_fields(&db, oid, doc! { "banner": &key }).await {
         Ok(Some(user)) => {
-            let mut cleanup_error = None;
+            let mut cleanup_pending = false;
             if let Some(banner) = previous_banner {
                 if banner != key && public_media_key_owned_by_user(&banner, &user_id) {
                     if let Err(error) = PendingStorageDeletion::delete_or_defer(
@@ -1882,7 +1910,7 @@ pub async fn add_profile_banner(
                     .await
                     {
                         log::error!("Failed to schedule cleanup for previous profile banner {banner}: {error}");
-                        cleanup_error = Some(error);
+                        cleanup_pending = true;
                     }
                 }
             }
@@ -1896,16 +1924,80 @@ pub async fn add_profile_banner(
                 }),
             )
             .await;
-            if cleanup_error.is_some() {
-                return HttpResponse::ServiceUnavailable().json(json!({
-                    "message": "Profile banner updated, but old banner cleanup is pending.",
-                    "retryable": true,
-                }));
-            }
-            HttpResponse::Ok().json(json!({ "banner": user.banner }))
+            HttpResponse::Ok().json(json!({
+                "banner": user.banner,
+                "cleanupPending": cleanup_pending,
+            }))
         }
-        Ok(None) => HttpResponse::NotFound().body("User not found."),
-        Err(_) => HttpResponse::InternalServerError().body("Internal Server Error."),
+        Ok(None) => {
+            if let Err(error) =
+                PendingStorageDeletion::delete_or_defer(&db, &key, StorageObjectKind::PublicMedia)
+                    .await
+            {
+                log::error!(
+                    "Failed to schedule cleanup for orphaned profile banner {key}: {error}"
+                );
+            }
+            HttpResponse::NotFound().body("User not found.")
+        }
+        Err(error) => {
+            log::error!("Failed to update profile banner for {user_id}: {error}");
+            match User::find_by_id(&db, oid).await {
+                Ok(Some(user)) if user.banner.as_deref() == Some(key.as_str()) => {
+                    let mut cleanup_pending = false;
+                    if let Some(banner) = previous_banner {
+                        if banner != key && public_media_key_owned_by_user(&banner, &user_id) {
+                            if let Err(cleanup_error) = PendingStorageDeletion::delete_or_defer(
+                                &db,
+                                &banner,
+                                StorageObjectKind::PublicMedia,
+                            )
+                            .await
+                            {
+                                log::error!(
+                                    "Failed to schedule cleanup for previous profile banner {banner}: {cleanup_error}"
+                                );
+                                cleanup_pending = true;
+                            }
+                        }
+                    }
+                    emit_profile_event(
+                        &db,
+                        &user_id,
+                        "profile-banner-updated",
+                        json!({ "userId": user_id, "banner": user.banner }),
+                    )
+                    .await;
+                    HttpResponse::Ok().json(json!({
+                        "banner": key,
+                        "cleanupPending": cleanup_pending,
+                    }))
+                }
+                Ok(_) => {
+                    if let Err(cleanup_error) = PendingStorageDeletion::delete_or_defer(
+                        &db,
+                        &key,
+                        StorageObjectKind::PublicMedia,
+                    )
+                    .await
+                    {
+                        log::error!(
+                            "Failed to schedule cleanup for unreferenced profile banner {key}: {cleanup_error}"
+                        );
+                    }
+                    HttpResponse::InternalServerError().body("Failed to update profile banner.")
+                }
+                Err(check_error) => {
+                    log::error!(
+                        "Could not verify profile banner {key} after update failure: {check_error}"
+                    );
+                    HttpResponse::ServiceUnavailable().json(json!({
+                        "message": "Profile banner update status is temporarily unavailable.",
+                        "retryable": true,
+                    }))
+                }
+            }
+        }
     }
 }
 
@@ -1930,7 +2022,7 @@ pub async fn remove_profile_banner(req: HttpRequest) -> HttpResponse {
     if let Some(banner) = &user.banner {
         match User::set_fields(&db, oid, doc! { "banner": Bson::Null }).await {
             Ok(Some(_)) => {
-                let mut cleanup_error = None;
+                let mut cleanup_pending = false;
                 if public_media_key_owned_by_user(banner, &user_id) {
                     if let Err(error) = PendingStorageDeletion::delete_or_defer(
                         &db,
@@ -1940,7 +2032,7 @@ pub async fn remove_profile_banner(req: HttpRequest) -> HttpResponse {
                     .await
                     {
                         log::error!("Failed to schedule cleanup for removed profile banner {banner}: {error}");
-                        cleanup_error = Some(error);
+                        cleanup_pending = true;
                     }
                 }
                 emit_profile_event(
@@ -1953,12 +2045,10 @@ pub async fn remove_profile_banner(req: HttpRequest) -> HttpResponse {
                     }),
                 )
                 .await;
-                if cleanup_error.is_some() {
-                    return HttpResponse::ServiceUnavailable().json(json!({
-                        "message": "Profile banner was removed, but storage cleanup is pending.",
-                        "retryable": true,
-                    }));
-                }
+                return HttpResponse::Ok().json(json!({
+                    "message": "Profile banner removed successfully",
+                    "cleanupPending": cleanup_pending,
+                }));
             }
             Ok(None) => {
                 return HttpResponse::NotFound().json(json!({ "error": "User not found" }));
@@ -1970,13 +2060,13 @@ pub async fn remove_profile_banner(req: HttpRequest) -> HttpResponse {
         }
     }
 
-    HttpResponse::Ok().json(json!({ "message": "Profile banner removed successfully" }))
+    HttpResponse::Ok().json(json!({
+        "message": "Profile banner removed successfully",
+        "cleanupPending": false,
+    }))
 }
 
-pub async fn disable_account(
-    req: HttpRequest,
-    body: web::Json<AccountActionBody>,
-) -> HttpResponse {
+pub async fn disable_account(req: HttpRequest, body: web::Json<AccountActionBody>) -> HttpResponse {
     let Some(user_id) = req_user_id(&req) else {
         return HttpResponse::Unauthorized().body("User not authenticated.");
     };
@@ -1991,10 +2081,11 @@ pub async fn disable_account(
         Err(_) => return HttpResponse::InternalServerError().body("Internal Server Error"),
     };
 
-    if user.is_disabled {
-        return HttpResponse::BadRequest().json(json!({
+    if user.is_disabled && !user.is_pending_deletion() {
+        invalidate_user_session(oid).await;
+        return HttpResponse::Ok().json(json!({
             "message": "Konto jest już wyłączone.",
-            "code": "ACCOUNT_ALREADY_DISABLED",
+            "code": "ACCOUNT_DISABLED",
         }));
     }
 
@@ -2005,15 +2096,15 @@ pub async fn disable_account(
         }));
     }
 
-    let password = body.password.as_deref().unwrap_or("").trim();
+    let password = body.password.as_deref().unwrap_or("");
     if let Err(response) =
-        verify_account_action_credentials(&user, password, body.code.as_deref(), &db, oid).await
+        verify_account_action_credentials(&user, password, body.code.as_deref(), &db).await
     {
         return response;
     }
 
     let now = DateTime::now();
-    if User::collection(&db)
+    let update_result = User::collection(&db)
         .update_one(
             doc! { "_id": oid },
             doc! {
@@ -2024,9 +2115,25 @@ pub async fn disable_account(
                 },
             },
         )
-        .await
-        .is_err()
-    {
+        .await;
+    let disabled = match update_result {
+        Ok(result) if result.matched_count > 0 => true,
+        Ok(_) | Err(_) => match User::find_by_id(&db, oid).await {
+            Ok(Some(current)) if current.is_disabled && !current.is_pending_deletion() => true,
+            Ok(_) => false,
+            Err(read_error) => {
+                log::error!(
+                    "disable_account: failed to verify account update for {user_id}: {read_error}"
+                );
+                return HttpResponse::ServiceUnavailable().json(json!({
+                    "message": "Nie można potwierdzić zmiany statusu konta.",
+                    "retryable": true,
+                    "outcomeUnknown": true,
+                }));
+            }
+        },
+    };
+    if !disabled {
         return HttpResponse::InternalServerError().json(json!({
             "message": "Nie udało się wyłączyć konta."
         }));
@@ -2059,15 +2166,21 @@ pub async fn request_account_deletion(
     };
 
     if user.is_pending_deletion() {
-        return HttpResponse::BadRequest().json(json!({
-            "message": "Konto jest już oznaczone do usunięcia.",
+        return HttpResponse::Ok().json(json!({
+            "message": format!(
+                "Konto jest już oznaczone do usunięcia. Możesz nadal korzystać z konta przez {} dni. Po tym czasie zostanie trwale usunięte, chyba że sam anulujesz tę operację w ustawieniach.",
+                DELETION_GRACE_DAYS
+            ),
             "code": "ACCOUNT_PENDING_DELETION",
+            "deletionScheduledAt": user.deletion_scheduled_at
+                .and_then(|scheduled| scheduled.try_to_rfc3339_string().ok()),
+            "graceDays": DELETION_GRACE_DAYS,
         }));
     }
 
-    let password = body.password.as_deref().unwrap_or("").trim();
+    let password = body.password.as_deref().unwrap_or("");
     if let Err(response) =
-        verify_account_action_credentials(&user, password, body.code.as_deref(), &db, oid).await
+        verify_account_action_credentials(&user, password, body.code.as_deref(), &db).await
     {
         return response;
     }
@@ -2075,9 +2188,7 @@ pub async fn request_account_deletion(
     let now = DateTime::now();
     let grace_ms = DELETION_GRACE_DAYS * 24 * 60 * 60 * 1000;
     let scheduled = DateTime::from_millis(now.timestamp_millis() + grace_ms);
-    let scheduled_iso = scheduled.try_to_rfc3339_string().ok();
-
-    if User::collection(&db)
+    let update_result = User::collection(&db)
         .update_one(
             doc! { "_id": oid },
             doc! {
@@ -2092,13 +2203,32 @@ pub async fn request_account_deletion(
                 },
             },
         )
-        .await
-        .is_err()
-    {
+        .await;
+    let confirmed_schedule = match update_result {
+        Ok(result) if result.matched_count > 0 => Some(scheduled),
+        Ok(_) | Err(_) => match User::find_by_id(&db, oid).await {
+            Ok(Some(current)) if current.is_pending_deletion() => {
+                current.deletion_scheduled_at.or(Some(scheduled))
+            }
+            Ok(_) => None,
+            Err(read_error) => {
+                log::error!(
+                    "request_account_deletion: failed to verify account update for {user_id}: {read_error}"
+                );
+                return HttpResponse::ServiceUnavailable().json(json!({
+                    "message": "Nie można potwierdzić żądania usunięcia konta.",
+                    "retryable": true,
+                    "outcomeUnknown": true,
+                }));
+            }
+        },
+    };
+    let Some(confirmed_schedule) = confirmed_schedule else {
         return HttpResponse::InternalServerError().json(json!({
             "message": "Nie udało się oznaczyć konta do usunięcia."
         }));
-    }
+    };
+    let scheduled_iso = confirmed_schedule.try_to_rfc3339_string().ok();
 
     HttpResponse::Ok().json(json!({
         "message": format!(
@@ -2130,21 +2260,21 @@ pub async fn cancel_account_deletion(
     };
 
     if !user.is_pending_deletion() {
-        return HttpResponse::BadRequest().json(json!({
-            "message": "Konto nie jest oznaczone do usunięcia.",
-            "code": "ACCOUNT_NOT_PENDING_DELETION",
+        return HttpResponse::Ok().json(json!({
+            "message": "Oznaczenie konta do usunięcia zostało już anulowane.",
+            "code": "ACCOUNT_DELETION_CANCELLED",
         }));
     }
 
-    let password = body.password.as_deref().unwrap_or("").trim();
+    let password = body.password.as_deref().unwrap_or("");
     if let Err(response) =
-        verify_account_action_credentials(&user, password, body.code.as_deref(), &db, oid).await
+        verify_account_action_credentials(&user, password, body.code.as_deref(), &db).await
     {
         return response;
     }
 
     let now = DateTime::now();
-    let cancellation = match User::collection(&db)
+    let cancellation = User::collection(&db)
         .update_one(
             doc! {
                 "_id": oid,
@@ -2161,20 +2291,52 @@ pub async fn cancel_account_deletion(
                 },
             },
         )
-        .await
-    {
-        Ok(result) => result,
-        Err(_) => {
-            return HttpResponse::InternalServerError().json(json!({
-                "message": "Nie udało się anulować usunięcia konta."
-            }));
-        }
-    };
-    if cancellation.modified_count == 0 {
-        return HttpResponse::Conflict().json(json!({
-            "message": "Usuwanie konta już się rozpoczęło i nie można go anulować.",
-            "code": "ACCOUNT_DELETION_IN_PROGRESS",
-        }));
+        .await;
+    match cancellation {
+        Ok(result) if result.modified_count > 0 => {}
+        Ok(_) => match User::find_by_id(&db, oid).await {
+            Ok(Some(current)) if !current.is_pending_deletion() => {}
+            Ok(Some(_)) => {
+                return HttpResponse::Conflict().json(json!({
+                    "message": "Usuwanie konta już się rozpoczęło i nie można go anulować.",
+                    "code": "ACCOUNT_DELETION_IN_PROGRESS",
+                }));
+            }
+            Ok(None) => return HttpResponse::NotFound().body("User not found."),
+            Err(read_error) => {
+                log::error!(
+                    "cancel_account_deletion: failed to verify cancellation for {user_id}: {read_error}"
+                );
+                return HttpResponse::ServiceUnavailable().json(json!({
+                    "message": "Nie można potwierdzić anulowania usunięcia konta.",
+                    "retryable": true,
+                    "outcomeUnknown": true,
+                }));
+            }
+        },
+        Err(update_error) => match User::find_by_id(&db, oid).await {
+            Ok(Some(current)) if !current.is_pending_deletion() => {}
+            Ok(Some(_)) => {
+                log::error!(
+                    "cancel_account_deletion: update failed and deletion remains scheduled for {user_id}: {update_error}"
+                );
+                return HttpResponse::ServiceUnavailable().json(json!({
+                    "message": "Nie udało się anulować usunięcia konta.",
+                    "retryable": true,
+                }));
+            }
+            Ok(None) => return HttpResponse::NotFound().body("User not found."),
+            Err(read_error) => {
+                log::error!(
+                    "cancel_account_deletion: update failed for {user_id}: {update_error}; verification failed: {read_error}"
+                );
+                return HttpResponse::ServiceUnavailable().json(json!({
+                    "message": "Nie można potwierdzić anulowania usunięcia konta.",
+                    "retryable": true,
+                    "outcomeUnknown": true,
+                }));
+            }
+        },
     }
 
     HttpResponse::Ok().json(json!({

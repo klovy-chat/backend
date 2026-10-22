@@ -154,10 +154,7 @@ impl Warning {
             .await
     }
 
-    pub async fn count_for_user(
-        db: &Database,
-        user_id: ObjectId,
-    ) -> mongodb::error::Result<u64> {
+    pub async fn count_for_user(db: &Database, user_id: ObjectId) -> mongodb::error::Result<u64> {
         Self::collection(db)
             .count_documents(doc! { "userId": user_id })
             .await

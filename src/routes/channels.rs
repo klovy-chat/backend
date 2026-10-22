@@ -10,11 +10,11 @@ use actix_web::web;
 use actix_web_lab::middleware::from_fn;
 
 use crate::controllers::channels::{
-    add_user_to_channel, ban_channel_member, create_channel, delete_channel,
-    delete_channel_avatar, get_channel_details, get_channel_messages,
-    get_user_channels, kick_channel_member, leave_channel, mute_channel_member, rename_channel,
-    report_channel, toggle_channel_mute, unban_channel_member,
-    unmute_channel_member, update_channel_chat_lock, update_channel_slowmode, upload_channel_avatar,
+    add_user_to_channel, ban_channel_member, create_channel, delete_channel, delete_channel_avatar,
+    get_channel_details, get_channel_messages, get_user_channels, kick_channel_member,
+    leave_channel, mute_channel_member, rename_channel, report_channel, toggle_channel_mute,
+    unban_channel_member, unmute_channel_member, update_channel_chat_lock, update_channel_slowmode,
+    upload_channel_avatar,
 };
 use crate::controllers::invites::{create_invite, delete_invite, list_invites};
 use crate::middlewares::auth::{require_active_account, verify_token};

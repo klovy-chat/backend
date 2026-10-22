@@ -16,48 +16,43 @@ use serde_json::json;
 use crate::middlewares::auth::request_user_id;
 use crate::model::channels::Channel;
 use crate::model::messages::{is_message_content_within_limit, Message};
-use crate::model::uploads::PendingUpload;
-use crate::utils::messages::mentions::{has_everyone_mention, resolve_mentions};
-use crate::model::storage_usage::UserStorageUsage;
-use crate::utils::hash::sha256_hex;
-use crate::model::users::User;
-use crate::utils::attachments::log_attachment_upload;
-use crate::utils::access::members::{
-    authorize_dm_history_read, require_channel_access, require_dm_access, require_message_participant,
-    AccessDeniedReason,
-};
-use crate::utils::db::get_db;
-use crate::utils::images::{
-    reencode_error_message, reencode_upload_to_webp_variants_async,
-};
-use crate::utils::messages::{
-    access::cleanup_attachment_if_unreferenced,
-    can_pin_message, try_can_pin_message, dm_conversation_base_clauses,
-    serialize_message, serialize_messages_batch, validate_dm_history_before_cursor,
-    message_belongs_to_dm_conversation,
-};
-use crate::utils::channel::is_channel_admin;
-use crate::utils::friends::are_friends;
-use crate::utils::messages::storage::inbound_plaintext_for_processing;
-use crate::utils::messages::search::{build_search_index_from_incoming, search_tokens_for_query};
-use crate::utils::storage::{
-    attachment_dm_key, attachment_group_key, attachment_thumb_key, storage,
-};
-use crate::utils::scan::{enqueue, ScanJob};
 use crate::model::scan::ScanStatus;
+use crate::model::storage_usage::UserStorageUsage;
+use crate::model::uploads::PendingUpload;
+use crate::model::users::User;
+use crate::utils::access::members::{
+    authorize_dm_history_read, require_channel_access, require_dm_access,
+    require_message_participant, AccessDeniedReason,
+};
+use crate::utils::attachments::log_attachment_upload;
+use crate::utils::channel::is_channel_admin;
+use crate::utils::db::get_db;
+use crate::utils::friends::are_friends;
+use crate::utils::hash::sha256_hex;
+use crate::utils::images::{reencode_error_message, reencode_upload_to_webp_variants_async};
+use crate::utils::link_preview::{fetch_link_preview, is_safe_preview_target};
+use crate::utils::messages::mentions::{has_everyone_mention, resolve_mentions};
+use crate::utils::messages::search::{build_search_index_from_incoming, search_tokens_for_query};
+use crate::utils::messages::storage::inbound_plaintext_for_processing;
+use crate::utils::messages::{
+    access::cleanup_attachment_if_unreferenced, can_pin_message, dm_conversation_base_clauses,
+    message_belongs_to_dm_conversation, serialize_message, serialize_messages_batch,
+    try_can_pin_message, validate_dm_history_before_cursor,
+};
+use crate::utils::ratelimit::Store;
 use crate::utils::ratelimit::{
     chat_attachment_retry_after_secs, try_consume_chat_attachment_quota,
 };
+use crate::utils::scan::{enqueue, ScanJob};
+use crate::utils::storage::{
+    attachment_dm_key, attachment_group_key, attachment_thumb_key, storage,
+};
 use crate::utils::upload::{
-    file_bytes_within_limit, is_image_extension, local_file_size, MAX_ATTACHMENT_BYTES,
-    MAX_CHAT_ATTACHMENTS_PER_WINDOW, MAX_IMAGE_ATTACHMENT_BYTES, CHAT_ATTACHMENT_WINDOW_SECS,
+    file_bytes_within_limit, is_image_extension, local_file_size, CHAT_ATTACHMENT_WINDOW_SECS,
+    MAX_ATTACHMENT_BYTES, MAX_CHAT_ATTACHMENTS_PER_WINDOW, MAX_IMAGE_ATTACHMENT_BYTES,
 };
+use crate::utils::validators::file_type::{resolve_upload_content_type, validate_file_magic_async};
 use crate::utils::validators::zip::validate_upload_document_async;
-use crate::utils::validators::file_type::{
-    resolve_upload_content_type, validate_file_magic_async,
-};
-use crate::utils::link_preview::{fetch_link_preview, is_safe_preview_target};
-use crate::utils::ratelimit::Store;
 use once_cell::sync::Lazy;
 use std::time::Duration;
 
@@ -108,7 +103,8 @@ pub async fn get_messages(req: HttpRequest, body: web::Json<GetMessagesBody>) ->
     }
 
     let db = get_db();
-    let (user_oid, contact_oid) = match authorize_dm_history_read(&db, &user_id, &contact_id).await {
+    let (user_oid, contact_oid) = match authorize_dm_history_read(&db, &user_id, &contact_id).await
+    {
         Ok(pair) => pair,
         Err(AccessDeniedReason::Unavailable) => {
             return HttpResponse::ServiceUnavailable().json(json!({
@@ -132,29 +128,23 @@ pub async fn get_messages(req: HttpRequest, body: web::Json<GetMessagesBody>) ->
     let mut and_clauses = dm_conversation_base_clauses(user_oid, contact_oid);
 
     if let Some(before_id) = body.before.as_deref().filter(|s| !s.is_empty()) {
-        let before_oid = match validate_dm_history_before_cursor(
-            &db,
-            user_oid,
-            contact_oid,
-            before_id,
-        )
-        .await
-        {
-            Ok(oid) => oid,
-            Err(crate::utils::messages::CursorValidateError::Unavailable) => {
-                return HttpResponse::ServiceUnavailable().json(json!({
-                    "error": "UNAVAILABLE",
-                    "message": "Temporarily unavailable. Retry.",
-                    "retryable": true,
-                }));
-            }
-            Err(crate::utils::messages::CursorValidateError::Invalid) => {
-                return HttpResponse::BadRequest().json(json!({
-                    "error": "INVALID_CURSOR",
-                    "message": "Invalid pagination cursor.",
-                }));
-            }
-        };
+        let before_oid =
+            match validate_dm_history_before_cursor(&db, user_oid, contact_oid, before_id).await {
+                Ok(oid) => oid,
+                Err(crate::utils::messages::CursorValidateError::Unavailable) => {
+                    return HttpResponse::ServiceUnavailable().json(json!({
+                        "error": "UNAVAILABLE",
+                        "message": "Temporarily unavailable. Retry.",
+                        "retryable": true,
+                    }));
+                }
+                Err(crate::utils::messages::CursorValidateError::Invalid) => {
+                    return HttpResponse::BadRequest().json(json!({
+                        "error": "INVALID_CURSOR",
+                        "message": "Invalid pagination cursor.",
+                    }));
+                }
+            };
         and_clauses.push(doc! { "_id": { "$lt": before_oid } });
     }
 
@@ -303,7 +293,8 @@ pub async fn upload_file(req: HttpRequest, form: MultipartForm<UploadFileForm>) 
                     }));
                 }
                 Err(_) => {
-                    return HttpResponse::Forbidden().body("You cannot upload to this conversation.");
+                    return HttpResponse::Forbidden()
+                        .body("You cannot upload to this conversation.");
                 }
             }
             let filename = format!("{}.{}", uuid::Uuid::new_v4(), stored_ext);
@@ -353,47 +344,10 @@ pub async fn upload_file(req: HttpRequest, form: MultipartForm<UploadFileForm>) 
             .body(format!("File too large. Maximum size is {limit_mb} MB."));
     }
 
-    if UserStorageUsage::would_exceed(&db, user_oid, total_stored)
-        .await
-        .unwrap_or(true)
-    {
-        return HttpResponse::PayloadTooLarge().body(
-            "Storage quota exceeded. Delete old attachments or wait for cleanup.",
-        );
-    }
-
     let file_hash = sha256_hex(&body);
     let client_mime = form.content_type.as_ref().map(|value| value.0.as_str());
     let content_type = resolve_upload_content_type(stored_ext, client_mime, &body);
-    if let Err(err) = storage()
-        .put_quarantine(&logical_path, body, &content_type)
-        .await
-    {
-        log::error!("put_quarantine {logical_path} failed: {err}");
-        return HttpResponse::InternalServerError().body("Internal Server Error.");
-    }
-
-    let thumb_path = attachment_thumb_key(&logical_path);
-    if let (Some(thumb_bytes), Some(thumb_key)) = (thumb_body, thumb_path.as_ref()) {
-        if let Err(err) = storage()
-            .put_quarantine(thumb_key, thumb_bytes, "image/webp")
-            .await
-        {
-            log::error!("put_quarantine thumb {thumb_key} failed: {err}");
-            if let Err(cleanup_error) = storage().delete_attachment_key(&logical_path).await {
-                log::error!(
-                    "Failed to roll back attachment {logical_path} after thumbnail upload failure: {cleanup_error}"
-                );
-                return HttpResponse::ServiceUnavailable().json(json!({
-                    "message": "Upload failed and storage cleanup is pending.",
-                    "retryable": true,
-                }));
-            }
-            return HttpResponse::InternalServerError().body("Internal Server Error.");
-        }
-    }
-
-    if let Err(register_error) = PendingUpload::register(
+    let pending_id = match PendingUpload::register(
         &db,
         user_oid,
         &logical_path,
@@ -406,56 +360,144 @@ pub async fn upload_file(req: HttpRequest, form: MultipartForm<UploadFileForm>) 
     )
     .await
     {
-        if let Err(cleanup_error) = storage().delete_attachment_key(&logical_path).await {
-            log::error!(
-                "Failed to roll back unregistered attachment {logical_path}: {cleanup_error}"
-            );
-            return HttpResponse::ServiceUnavailable().json(json!({
-                "message": "Upload registration failed and storage cleanup is pending.",
-                "retryable": true,
-            }));
-        }
-        match PendingUpload::count_for_user(&db, user_oid).await {
-            Ok(count) if count >= crate::utils::upload::MAX_PENDING_UPLOADS_PER_USER => {
-                return HttpResponse::TooManyRequests()
-                    .body("Too many pending uploads. Send or wait before uploading more.");
+        Ok(id) => id,
+        Err(register_error) => {
+            match PendingUpload::count_for_user(&db, user_oid).await {
+                Ok(count) if count >= crate::utils::upload::MAX_PENDING_UPLOADS_PER_USER => {
+                    return HttpResponse::TooManyRequests()
+                        .body("Too many pending uploads. Send or wait before uploading more.");
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    log::error!(
+                        "Failed to inspect pending uploads after registration error: {error}"
+                    );
+                    return HttpResponse::ServiceUnavailable().json(json!({
+                        "message": "Temporarily unavailable.",
+                        "retryable": true,
+                    }));
+                }
             }
-            Ok(_) => {}
-            Err(error) => {
-                log::error!("Failed to inspect pending uploads after registration error: {error}");
+            log::error!("Failed to register pending attachment {logical_path}: {register_error}");
+            return HttpResponse::InternalServerError().body("Internal Server Error.");
+        }
+    };
+
+    match UserStorageUsage::reserve_for_upload(&db, user_oid, total_stored, pending_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            if let Err(error) = PendingUpload::claim_by_path(&db, user_oid, &logical_path).await {
+                log::error!("Failed to remove over-quota pending upload {logical_path}: {error}");
                 return HttpResponse::ServiceUnavailable().json(json!({
-                    "message": "Temporarily unavailable.",
+                    "message": "Upload failed and rollback is incomplete.",
                     "retryable": true,
                 }));
             }
+            return HttpResponse::PayloadTooLarge()
+                .body("Storage quota exceeded. Delete old attachments or wait for cleanup.");
         }
-        log::error!("Failed to register pending attachment {logical_path}: {register_error}");
-        return HttpResponse::InternalServerError().body("Internal Server Error.");
+        Err(error) => {
+            log::error!("Failed to reserve storage quota for {logical_path}: {error}");
+            if let Err(cleanup_error) =
+                PendingUpload::claim_by_path(&db, user_oid, &logical_path).await
+            {
+                log::error!(
+                    "Failed to roll back quota reservation for {logical_path}: {cleanup_error}"
+                );
+            }
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "message": "Storage quota is temporarily unavailable.",
+                "retryable": true,
+            }));
+        }
     }
 
-    if let Err(usage_error) = UserStorageUsage::adjust(&db, user_oid, total_stored as i64).await {
-        log::error!("Failed to account uploaded attachment {logical_path}: {usage_error}");
+    match PendingUpload::mark_quota_reserved(&db, user_oid, &logical_path).await {
+        Ok(true) => {}
+        Ok(false) => {
+            log::error!(
+                "Pending upload {logical_path} disappeared after storage quota reservation"
+            );
+            if let Err(error) =
+                crate::model::storage_usage::UserStorageUsage::release_upload_reservation(
+                    &db, user_oid, pending_id, None,
+                )
+                .await
+            {
+                log::error!(
+                    "Failed to release quota for missing pending upload {logical_path}: {error}"
+                );
+            }
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "message": "Upload registration is temporarily unavailable.",
+                "retryable": true,
+            }));
+        }
+        Err(error) => {
+            log::error!(
+                "Failed to record quota reservation for pending upload {logical_path}: {error}"
+            );
+            if let Err(cleanup_error) =
+                PendingUpload::claim_by_path(&db, user_oid, &logical_path).await
+            {
+                log::error!(
+                    "Failed to roll back quota reservation for {logical_path}: {cleanup_error}"
+                );
+            }
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "message": "Upload registration is temporarily unavailable.",
+                "retryable": true,
+            }));
+        }
+    }
+
+    if let Err(error) = storage()
+        .put_quarantine(&logical_path, body, &content_type)
+        .await
+    {
+        log::error!("put_quarantine {logical_path} failed: {error}");
         if let Err(cleanup_error) = storage().delete_attachment_key(&logical_path).await {
             log::error!(
-                "Failed to roll back attachment {logical_path} after storage accounting failure: {cleanup_error}"
+                "Failed to roll back incomplete attachment {logical_path}: {cleanup_error}"
             );
-            return HttpResponse::ServiceUnavailable().json(json!({
-                "message": "Upload accounting failed and storage cleanup is pending.",
-                "retryable": true,
-            }));
-        }
-        if let Err(pending_error) =
+        } else if let Err(cleanup_error) =
             PendingUpload::claim_by_path(&db, user_oid, &logical_path).await
         {
-            log::error!(
-                "Failed to remove pending upload {logical_path} after rollback: {pending_error}"
-            );
-            return HttpResponse::ServiceUnavailable().json(json!({
-                "message": "Upload accounting failed and rollback is incomplete.",
-                "retryable": true,
-            }));
+            log::error!("Failed to remove pending upload {logical_path}: {cleanup_error}");
         }
-        return HttpResponse::InternalServerError().body("Internal Server Error.");
+        return HttpResponse::ServiceUnavailable().json(json!({
+            "message": "Upload failed and cleanup may still be pending.",
+            "retryable": true,
+        }));
+    }
+
+    let thumb_path = attachment_thumb_key(&logical_path);
+    if let (Some(thumb_bytes), Some(thumb_key)) = (thumb_body, thumb_path.as_ref()) {
+        if let Err(error) = storage()
+            .put_quarantine(thumb_key, thumb_bytes, "image/webp")
+            .await
+        {
+            log::error!("put_quarantine thumb {thumb_key} failed: {error}");
+            if let Err(cleanup_error) = storage().delete_attachment_key(&logical_path).await {
+                log::error!(
+                    "Failed to roll back attachment {logical_path} after thumbnail upload failure: {cleanup_error}"
+                );
+                return HttpResponse::ServiceUnavailable().json(json!({
+                    "message": "Upload failed and storage cleanup is pending.",
+                    "retryable": true,
+                }));
+            }
+            if let Err(cleanup_error) =
+                PendingUpload::claim_by_path(&db, user_oid, &logical_path).await
+            {
+                log::error!("Failed to remove pending upload {logical_path}: {cleanup_error}");
+                return HttpResponse::ServiceUnavailable().json(json!({
+                    "message": "Upload failed and rollback is incomplete.",
+                    "retryable": true,
+                }));
+            }
+            return HttpResponse::InternalServerError().body("Internal Server Error.");
+        }
     }
 
     enqueue(ScanJob {
@@ -519,7 +561,10 @@ pub async fn edit_message(req: HttpRequest, body: web::Json<EditMessageBody>) ->
     let message = match Message::find_by_id(&db, mid).await {
         Ok(Some(m)) => m,
         Ok(None) => return HttpResponse::NotFound().json(json!({ "error": "Message not found" })),
-        Err(_) => return HttpResponse::InternalServerError().json(json!({ "error": "Internal server error", "retryable": true })),
+        Err(_) => {
+            return HttpResponse::InternalServerError()
+                .json(json!({ "error": "Internal server error", "retryable": true }))
+        }
     };
 
     if message.sender.to_hex() != user_id {
@@ -548,7 +593,8 @@ pub async fn edit_message(req: HttpRequest, body: web::Json<EditMessageBody>) ->
     let content = inbound_plaintext_for_processing(&content, false);
 
     if content.trim().is_empty() {
-        return HttpResponse::BadRequest().json(json!({ "error": "Treść wiadomości jest wymagana" }));
+        return HttpResponse::BadRequest()
+            .json(json!({ "error": "Treść wiadomości jest wymagana" }));
     }
     if !is_message_content_within_limit(&content) {
         return HttpResponse::BadRequest()
@@ -625,11 +671,17 @@ pub async fn edit_message(req: HttpRequest, body: web::Json<EditMessageBody>) ->
     .await
     {
         Ok(c) => c,
-        Err(_) => return HttpResponse::InternalServerError().json(json!({ "error": "Internal server error", "retryable": true })),
+        Err(_) => {
+            return HttpResponse::InternalServerError()
+                .json(json!({ "error": "Internal server error", "retryable": true }))
+        }
     };
     let search_index = match build_search_index_from_incoming(content.trim()) {
         Ok(index) => index,
-        Err(_) => return HttpResponse::InternalServerError().json(json!({ "error": "Internal server error", "retryable": true })),
+        Err(_) => {
+            return HttpResponse::InternalServerError()
+                .json(json!({ "error": "Internal server error", "retryable": true }))
+        }
     };
     let set_doc = doc! {
         "content": stored_content,
@@ -679,182 +731,176 @@ pub async fn edit_message(req: HttpRequest, body: web::Json<EditMessageBody>) ->
             crate::utils::tips::upsert_dm_tip(&db, &tip_msg).await;
         }
     }
-            let populated = serialize_message(&db, &updated).await;
-            let previous_mentions: std::collections::HashSet<String> =
-                message.mentions.iter().map(|id| id.to_hex()).collect();
-            let previous_everyone = message.mentions_everyone;
-            let sender_id = updated.sender.to_hex();
-            let from_user = populated
-                .get("sender")
-                .cloned()
-                .unwrap_or(json!({ "_id": sender_id }));
-            let preview_content = content.trim().to_string();
-            let message_id_hex = mid.to_hex();
+    let populated = serialize_message(&db, &updated).await;
+    let previous_mentions: std::collections::HashSet<String> =
+        message.mentions.iter().map(|id| id.to_hex()).collect();
+    let previous_everyone = message.mentions_everyone;
+    let sender_id = updated.sender.to_hex();
+    let from_user = populated
+        .get("sender")
+        .cloned()
+        .unwrap_or(json!({ "_id": sender_id }));
+    let preview_content = content.trim().to_string();
+    let message_id_hex = mid.to_hex();
 
-            let muted_lookup: Option<std::collections::HashSet<String>> =
-                if let Some(channel_oid) = updated.channel {
-                    if let Ok(Some(channel)) = Channel::find_by_id(&db, channel_oid).await {
-                        use mongodb::bson::Document;
-                        let coll = db.collection::<Document>("users");
-                        let mut member_oids = channel.members.clone();
-                        if !member_oids.iter().any(|id| *id == channel.admin) {
-                            member_oids.push(channel.admin);
-                        }
-                        match coll
-                            .find(doc! {
-                                "_id": { "$in": &member_oids },
-                                "mutedChannels": channel_oid,
-                            })
-                            .projection(doc! { "_id": 1 })
-                            .await
-                        {
-                            Ok(mut cursor) => {
-                                let mut set = std::collections::HashSet::new();
-                                let mut ok = true;
-                                loop {
-                                    match cursor.try_next().await {
-                                        Ok(Some(d)) => {
-                                            if let Ok(id) = d.get_object_id("_id") {
-                                                set.insert(id.to_hex());
-                                            }
-                                        }
-                                        Ok(None) => break,
-                                        Err(_) => {
-                                            ok = false;
-                                            break;
-                                        }
+    let muted_lookup: Option<std::collections::HashSet<String>> =
+        if let Some(channel_oid) = updated.channel {
+            if let Ok(Some(channel)) = Channel::find_by_id(&db, channel_oid).await {
+                use mongodb::bson::Document;
+                let coll = db.collection::<Document>("users");
+                let mut member_oids = channel.members.clone();
+                if !member_oids.iter().any(|id| *id == channel.admin) {
+                    member_oids.push(channel.admin);
+                }
+                match coll
+                    .find(doc! {
+                        "_id": { "$in": &member_oids },
+                        "mutedChannels": channel_oid,
+                    })
+                    .projection(doc! { "_id": 1 })
+                    .await
+                {
+                    Ok(mut cursor) => {
+                        let mut set = std::collections::HashSet::new();
+                        let mut ok = true;
+                        loop {
+                            match cursor.try_next().await {
+                                Ok(Some(d)) => {
+                                    if let Ok(id) = d.get_object_id("_id") {
+                                        set.insert(id.to_hex());
                                     }
                                 }
-                                if ok {
-                                    Some(set)
-                                } else {
-                                    None
+                                Ok(None) => break,
+                                Err(_) => {
+                                    ok = false;
+                                    break;
                                 }
                             }
-                            Err(_) => None,
                         }
-                    } else {
-                        None
-                    }
-                } else if let Some(recipient) = updated.recipient {
-                    use mongodb::bson::Document;
-                    let coll = db.collection::<Document>("users");
-                    match coll
-                        .find_one(doc! { "_id": recipient })
-                        .projection(doc! { "mutedContacts": 1 })
-                        .await
-                    {
-                        Ok(Some(doc)) => {
-                            let muted = doc
-                                .get_array("mutedContacts")
-                                .ok()
-                                .map(|arr| {
-                                    arr.iter().any(|b| {
-                                        b.as_object_id()
-                                            .map(|id| id.to_hex() == sender_id)
-                                            .unwrap_or(false)
-                                    })
-                                })
-                                .unwrap_or(false);
-                            if muted {
-                                Some(std::collections::HashSet::from([recipient.to_hex()]))
-                            } else {
-                                Some(std::collections::HashSet::new())
-                            }
-                        }
-                        Ok(None) => None,
-                        Err(_) => None,
-                    }
-                } else {
-                    Some(std::collections::HashSet::new())
-                };
-            let mentions_ok = muted_lookup.is_some();
-            let muted_ids = muted_lookup.unwrap_or_default();
-
-            let emit_new_mention = |member_id: &str, scope: &str, source_id: &str, source_name: Option<&str>| {
-                if !mentions_ok || member_id == sender_id || muted_ids.contains(member_id) {
-                    return;
-                }
-                let newly = (mentions.iter().any(|id| id.to_hex() == member_id)
-                    && !previous_mentions.contains(member_id))
-                    || (mentions_everyone && !previous_everyone);
-                if !newly {
-                    return;
-                }
-                let preview = if preview_content.chars().count() > 140 {
-                    format!("{}…", preview_content.chars().take(140).collect::<String>())
-                } else {
-                    preview_content.clone()
-                };
-                crate::ws::registry::emit_to_user(
-                    member_id,
-                    "message-mention",
-                    json!({
-                        "scope": scope,
-                        "sourceId": source_id,
-                        "sourceName": source_name,
-                        "messageId": message_id_hex,
-                        "from": from_user,
-                        "preview": preview,
-                    }),
-                );
-            };
-
-            if let Some(channel_id) = updated.channel {
-                let channel = match Channel::find_by_id(&db, channel_id).await {
-                    Ok(Some(ch)) => Some(ch),
-
-                    Ok(None) | Err(_) => None,
-                };
-                if let Some(channel) = channel {
-                    let recipients = crate::ws::registry::channel_recipient_ids(&channel);
-                    crate::ws::registry::emit_to_users(
-                        &recipients,
-                        "message-edited",
-                        populated.clone(),
-                    );
-                    let channel_id_hex = channel_id.to_hex();
-                    for r in &recipients {
-                        emit_new_mention(r, "channel", &channel_id_hex, Some(&channel.name));
-                    }
-                } else {
-
-                    use crate::model::read_state::ChannelReadState;
-                    use futures_util::TryStreamExt;
-                    let mut recipients = vec![sender_id.clone()];
-                    if let Ok(cursor) = ChannelReadState::collection(&db)
-                        .find(doc! { "channelId": channel_id })
-                        .await
-                    {
-                        let states: Vec<ChannelReadState> =
-                            cursor.try_collect().await.unwrap_or_default();
-                        for s in states {
-                            let id = s.user_id.to_hex();
-                            if !recipients.iter().any(|r| r == &id) {
-                                recipients.push(id);
-                            }
+                        if ok {
+                            Some(set)
+                        } else {
+                            None
                         }
                     }
-                    crate::ws::registry::emit_to_users(
-                        &recipients,
-                        "message-edited",
-                        populated.clone(),
-                    );
+                    Err(_) => None,
                 }
-            } else if let Some(recipient) = updated.recipient {
-                crate::ws::registry::emit_to_user(
-                    &recipient.to_hex(),
-                    "message-edited",
-                    populated.clone(),
-                );
-                crate::ws::registry::emit_to_user(
-                    &updated.sender.to_hex(),
-                    "message-edited",
-                    populated.clone(),
-                );
-                emit_new_mention(&recipient.to_hex(), "dm", &sender_id, None);
+            } else {
+                None
             }
-            HttpResponse::Ok().json(json!({ "message": populated }))
+        } else if let Some(recipient) = updated.recipient {
+            use mongodb::bson::Document;
+            let coll = db.collection::<Document>("users");
+            match coll
+                .find_one(doc! { "_id": recipient })
+                .projection(doc! { "mutedContacts": 1 })
+                .await
+            {
+                Ok(Some(doc)) => {
+                    let muted = doc
+                        .get_array("mutedContacts")
+                        .ok()
+                        .map(|arr| {
+                            arr.iter().any(|b| {
+                                b.as_object_id()
+                                    .map(|id| id.to_hex() == sender_id)
+                                    .unwrap_or(false)
+                            })
+                        })
+                        .unwrap_or(false);
+                    if muted {
+                        Some(std::collections::HashSet::from([recipient.to_hex()]))
+                    } else {
+                        Some(std::collections::HashSet::new())
+                    }
+                }
+                Ok(None) => None,
+                Err(_) => None,
+            }
+        } else {
+            Some(std::collections::HashSet::new())
+        };
+    let mentions_ok = muted_lookup.is_some();
+    let muted_ids = muted_lookup.unwrap_or_default();
+
+    let emit_new_mention =
+        |member_id: &str, scope: &str, source_id: &str, source_name: Option<&str>| {
+            if !mentions_ok || member_id == sender_id || muted_ids.contains(member_id) {
+                return;
+            }
+            let newly = (mentions.iter().any(|id| id.to_hex() == member_id)
+                && !previous_mentions.contains(member_id))
+                || (mentions_everyone && !previous_everyone);
+            if !newly {
+                return;
+            }
+            let preview = if preview_content.chars().count() > 140 {
+                format!("{}…", preview_content.chars().take(140).collect::<String>())
+            } else {
+                preview_content.clone()
+            };
+            crate::ws::registry::emit_to_user(
+                member_id,
+                "message-mention",
+                json!({
+                    "scope": scope,
+                    "sourceId": source_id,
+                    "sourceName": source_name,
+                    "messageId": message_id_hex,
+                    "from": from_user,
+                    "preview": preview,
+                }),
+            );
+        };
+
+    if let Some(channel_id) = updated.channel {
+        let channel = match Channel::find_by_id(&db, channel_id).await {
+            Ok(Some(ch)) => Some(ch),
+            Ok(None) => None,
+            Err(error) => {
+                log::error!(
+                    "Failed to load channel {} for message edit fanout: {error}",
+                    channel_id.to_hex()
+                );
+                None
+            }
+        };
+        if let Some(channel) = channel {
+            let recipients = crate::ws::registry::channel_recipient_ids(&channel);
+            crate::ws::registry::emit_to_users(&recipients, "message-edited", populated.clone());
+            let channel_id_hex = channel_id.to_hex();
+            for r in &recipients {
+                emit_new_mention(r, "channel", &channel_id_hex, Some(&channel.name));
+            }
+        } else {
+            let mut recipients = vec![sender_id.clone()];
+            match crate::utils::channel::channel_read_state_user_ids(&db, channel_id).await {
+                Ok(user_ids) => {
+                    for id in user_ids {
+                        if !recipients.iter().any(|recipient| recipient == &id) {
+                            recipients.push(id);
+                        }
+                    }
+                }
+                Err(error) => {
+                    log::error!(
+                        "Failed to load channel read-state recipients for message edit in channel {}: {error}",
+                        channel_id.to_hex()
+                    );
+                }
+            }
+            crate::ws::registry::emit_to_users(&recipients, "message-edited", populated.clone());
+        }
+    } else if let Some(recipient) = updated.recipient {
+        crate::ws::registry::emit_to_user(&recipient.to_hex(), "message-edited", populated.clone());
+        crate::ws::registry::emit_to_user(
+            &updated.sender.to_hex(),
+            "message-edited",
+            populated.clone(),
+        );
+        emit_new_mention(&recipient.to_hex(), "dm", &sender_id, None);
+    }
+    HttpResponse::Ok().json(json!({ "message": populated }))
 }
 
 pub async fn delete_message(req: HttpRequest) -> HttpResponse {
@@ -870,7 +916,10 @@ pub async fn delete_message(req: HttpRequest) -> HttpResponse {
     let message = match Message::find_by_id(&db, mid).await {
         Ok(Some(m)) => m,
         Ok(None) => return HttpResponse::NotFound().json(json!({ "error": "Message not found" })),
-        Err(_) => return HttpResponse::InternalServerError().json(json!({ "error": "Internal server error", "retryable": true })),
+        Err(_) => {
+            return HttpResponse::InternalServerError()
+                .json(json!({ "error": "Internal server error", "retryable": true }))
+        }
     };
 
     if message.sender.to_hex() != user_id {
@@ -901,25 +950,28 @@ pub async fn delete_message(req: HttpRequest) -> HttpResponse {
         crate::model::messages::SoftDeleteOutcome::Deleted { was_unread } => was_unread,
         crate::model::messages::SoftDeleteOutcome::AlreadyDeleted => false,
     };
-    if let Err(e) = cleanup_attachment_if_unreferenced(&db, message.file_url.as_deref()).await {
-        log::error!("Failed to clean up deleted message attachment {message_id}: {e}");
-        return HttpResponse::ServiceUnavailable().json(json!({
-            "error": "Message was deleted, but attachment cleanup is incomplete.",
-            "retryable": true,
-        }));
-    }
+    let cleanup_pending = if let Err(error) =
+        cleanup_attachment_if_unreferenced(&db, message.file_url.as_deref()).await
+    {
+        log::error!("Failed to clean up deleted message attachment {message_id}: {error}");
+        true
+    } else {
+        false
+    };
     if let Some(channel_id) = message.channel {
-        crate::utils::tips::refresh_channel_tip_after_delete(&db, channel_id, mid)
-            .await;
+        crate::utils::tips::refresh_channel_tip_after_delete(&db, channel_id, mid).await;
         let body = json!({ "_id": message_id });
 
         let channel = match crate::model::channels::Channel::find_by_id(&db, channel_id).await {
             Ok(Some(ch)) => Some(ch),
             Ok(None) => None,
-            Err(_) => crate::model::channels::Channel::find_by_id(&db, channel_id)
-                .await
-                .ok()
-                .flatten(),
+            Err(error) => {
+                log::error!(
+                    "Failed to load channel {} for message deletion fanout: {error}",
+                    channel_id.to_hex()
+                );
+                None
+            }
         };
         if let Some(channel) = channel {
             let recipients = crate::ws::registry::channel_recipient_ids(&channel);
@@ -929,8 +981,7 @@ pub async fn delete_message(req: HttpRequest) -> HttpResponse {
             let channel_id_hex = channel_id.to_hex();
             use crate::model::read_state::ChannelReadState;
             use futures_util::TryStreamExt;
-            let mut targets: Vec<String> =
-                channel.members.iter().map(|m| m.to_hex()).collect();
+            let mut targets: Vec<String> = channel.members.iter().map(|m| m.to_hex()).collect();
             targets.push(channel.admin.to_hex());
             let member_oids: Vec<ObjectId> = targets
                 .iter()
@@ -938,25 +989,35 @@ pub async fn delete_message(req: HttpRequest) -> HttpResponse {
                 .collect();
             let mut last_reads: std::collections::HashMap<String, (DateTime, DateTime)> =
                 std::collections::HashMap::new();
-            let mut read_state_ok = false;
-            if let Ok(cursor) = ChannelReadState::collection(&db)
+            let read_state_ok;
+            match ChannelReadState::collection(&db)
                 .find(doc! {
                     "channelId": channel_id,
                     "userId": { "$in": &member_oids },
                 })
                 .await
             {
-                match cursor.try_collect::<Vec<ChannelReadState>>().await {
+                Ok(cursor) => match cursor.try_collect::<Vec<ChannelReadState>>().await {
                     Ok(states) => {
                         read_state_ok = true;
                         for s in states {
-                            last_reads
-                                .insert(s.user_id.to_hex(), (s.last_read_at, s.created_at));
+                            last_reads.insert(s.user_id.to_hex(), (s.last_read_at, s.created_at));
                         }
                     }
-                    Err(_) => {
+                    Err(error) => {
+                        log::error!(
+                                "Failed to read channel read states for deleted-message fanout in channel {}: {error}",
+                                channel_id.to_hex()
+                            );
                         read_state_ok = false;
                     }
+                },
+                Err(error) => {
+                    log::error!(
+                        "Failed to query channel read states for deleted-message fanout in channel {}: {error}",
+                        channel_id.to_hex()
+                    );
+                    read_state_ok = false;
                 }
             }
             let mut seen = std::collections::HashSet::new();
@@ -974,7 +1035,6 @@ pub async fn delete_message(req: HttpRequest) -> HttpResponse {
                     continue;
                 }
                 let Some(&(last, created)) = last_reads.get(&member_id) else {
-
                     affected.push((member_id, oid));
                     continue;
                 };
@@ -994,10 +1054,9 @@ pub async fn delete_message(req: HttpRequest) -> HttpResponse {
                     let db = db.clone();
                     let channel_id_hex = channel_id_hex.clone();
                     async move {
-                        if let Some(n) = crate::utils::unread::try_sync_channel_unread(
-                            &db, oid, channel_id,
-                        )
-                        .await
+                        if let Some(n) =
+                            crate::utils::unread::try_sync_channel_unread(&db, oid, channel_id)
+                                .await
                         {
                             crate::utils::unread::emit_unread_absolute(
                                 &member_id,
@@ -1011,8 +1070,11 @@ pub async fn delete_message(req: HttpRequest) -> HttpResponse {
                 .collect();
             futures_util::future::join_all(sync_futs).await;
         } else {
-
-            crate::ws::registry::emit_to_user(&message.sender.to_hex(), "message-deleted", body.clone());
+            crate::ws::registry::emit_to_user(
+                &message.sender.to_hex(),
+                "message-deleted",
+                body.clone(),
+            );
             crate::ws::registry::emit_to_user(
                 &user_id,
                 "error",
@@ -1032,7 +1094,6 @@ pub async fn delete_message(req: HttpRequest) -> HttpResponse {
                 let states: Vec<ChannelReadState> = match cursor.try_collect().await {
                     Ok(s) => s,
                     Err(e) => {
-
                         log::error!("delete_message channel fanout try_collect: {e}");
                         crate::ws::registry::emit_to_user(
                             &user_id,
@@ -1047,6 +1108,7 @@ pub async fn delete_message(req: HttpRequest) -> HttpResponse {
                         return HttpResponse::Ok().json(json!({
                             "ok": true,
                             "degraded": true,
+                            "cleanupPending": cleanup_pending,
                         }));
                     }
                 };
@@ -1077,13 +1139,7 @@ pub async fn delete_message(req: HttpRequest) -> HttpResponse {
             }
         }
     } else if let Some(recipient) = message.recipient {
-        crate::utils::tips::refresh_dm_tip_after_delete(
-            &db,
-            message.sender,
-            recipient,
-            mid,
-        )
-        .await;
+        crate::utils::tips::refresh_dm_tip_after_delete(&db, message.sender, recipient, mid).await;
         let body = json!({ "_id": message_id });
         crate::ws::registry::emit_to_user(&recipient.to_hex(), "message-deleted", body.clone());
         crate::ws::registry::emit_to_user(&message.sender.to_hex(), "message-deleted", body);
@@ -1091,12 +1147,8 @@ pub async fn delete_message(req: HttpRequest) -> HttpResponse {
             let recipient_hex = recipient.to_hex();
             let sender_oid = message.sender;
 
-            if let Some(n) = crate::utils::tips::try_sync_dm_tip_unread(
-                &db,
-                recipient,
-                sender_oid,
-            )
-            .await
+            if let Some(n) =
+                crate::utils::tips::try_sync_dm_tip_unread(&db, recipient, sender_oid).await
             {
                 crate::utils::unread::emit_unread_absolute(
                     &recipient_hex,
@@ -1107,7 +1159,10 @@ pub async fn delete_message(req: HttpRequest) -> HttpResponse {
             }
         }
     }
-    HttpResponse::Ok().json(json!({ "success": true }))
+    HttpResponse::Ok().json(json!({
+        "success": true,
+        "cleanupPending": cleanup_pending,
+    }))
 }
 
 pub async fn pin_message(req: HttpRequest) -> HttpResponse {
@@ -1302,35 +1357,45 @@ async fn emit_message_pin_fanout(
     if let Some(channel_id) = updated.channel {
         let channel = match Channel::find_by_id(db, channel_id).await {
             Ok(Some(ch)) => Some(ch),
-
-            Ok(None) | Err(_) => None,
+            Ok(None) => None,
+            Err(error) => {
+                log::error!(
+                    "Failed to load channel {} for pinned message fanout: {error}",
+                    channel_id.to_hex()
+                );
+                None
+            }
         };
         if let Some(channel) = channel {
             let recipients = crate::ws::registry::channel_recipient_ids(&channel);
             crate::ws::registry::emit_to_users(&recipients, "message-edited", populated.clone());
         } else {
-            use crate::model::read_state::ChannelReadState;
-            use futures_util::TryStreamExt;
             let mut recipients = vec![actor_id.to_string(), updated.sender.to_hex()];
             recipients.dedup();
-            if let Ok(cursor) = ChannelReadState::collection(db)
-                .find(doc! { "channelId": channel_id })
-                .await
-            {
-                let states: Vec<ChannelReadState> =
-                    cursor.try_collect().await.unwrap_or_default();
-                for s in states {
-                    let id = s.user_id.to_hex();
-                    if !recipients.iter().any(|r| r == &id) {
-                        recipients.push(id);
+            match crate::utils::channel::channel_read_state_user_ids(db, channel_id).await {
+                Ok(user_ids) => {
+                    for id in user_ids {
+                        if !recipients.iter().any(|recipient| recipient == &id) {
+                            recipients.push(id);
+                        }
                     }
+                }
+                Err(error) => {
+                    log::error!(
+                        "Failed to load channel read-state recipients for pinned message fanout in channel {}: {error}",
+                        channel_id.to_hex()
+                    );
                 }
             }
             crate::ws::registry::emit_to_users(&recipients, "message-edited", populated.clone());
         }
     } else if let Some(recipient) = updated.recipient {
         crate::ws::registry::emit_to_user(&recipient.to_hex(), "message-edited", populated.clone());
-        crate::ws::registry::emit_to_user(&updated.sender.to_hex(), "message-edited", populated.clone());
+        crate::ws::registry::emit_to_user(
+            &updated.sender.to_hex(),
+            "message-edited",
+            populated.clone(),
+        );
         if actor_id != updated.sender.to_hex() && actor_id != recipient.to_hex() {
             crate::ws::registry::emit_to_user(actor_id, "message-edited", populated.clone());
         }
@@ -1467,7 +1532,10 @@ pub struct SearchMessagesBody {
     pub channel_id: Option<String>,
 }
 
-pub async fn search_messages(req: HttpRequest, body: web::Json<SearchMessagesBody>) -> HttpResponse {
+pub async fn search_messages(
+    req: HttpRequest,
+    body: web::Json<SearchMessagesBody>,
+) -> HttpResponse {
     let Some(user_id) = request_user_id(&req) else {
         return HttpResponse::Unauthorized().json(json!({ "error": "Unauthorized" }));
     };

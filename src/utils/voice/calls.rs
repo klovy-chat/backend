@@ -127,10 +127,7 @@ pub fn create_ringing_session(
     Ok((session_id, replaced_expired))
 }
 
-fn user_has_active_session_locked(
-    sessions: &HashMap<String, CallSession>,
-    user_id: &str,
-) -> bool {
+fn user_has_active_session_locked(sessions: &HashMap<String, CallSession>, user_id: &str) -> bool {
     sessions.values().any(|session| {
         if session.caller_id != user_id && session.callee_id != user_id {
             return false;
@@ -206,9 +203,8 @@ pub fn end_session(user_id: &str, peer_id: &str) -> Result<CallSession, CallSess
     let Some(session) = sessions.get(&key) else {
         return Err(CallSessionError::NotFound);
     };
-    let is_participant =
-        (session.caller_id == user_id && session.callee_id == peer_id)
-            || (session.callee_id == user_id && session.caller_id == peer_id);
+    let is_participant = (session.caller_id == user_id && session.callee_id == peer_id)
+        || (session.callee_id == user_id && session.caller_id == peer_id);
     if !is_participant {
         return Err(CallSessionError::WrongRole);
     }
@@ -222,9 +218,8 @@ pub fn token_allowed(user_id: &str, peer_id: &str) -> Result<CallSession, CallSe
     let Some(session) = sessions.get(&key) else {
         return Err(CallSessionError::NotFound);
     };
-    let is_participant =
-        (session.caller_id == user_id && session.callee_id == peer_id)
-            || (session.callee_id == user_id && session.caller_id == peer_id);
+    let is_participant = (session.caller_id == user_id && session.callee_id == peer_id)
+        || (session.callee_id == user_id && session.caller_id == peer_id);
     if !is_participant {
         return Err(CallSessionError::WrongRole);
     }
@@ -261,7 +256,6 @@ fn connection_owns_side(session: &CallSession, user_id: &str, conn_id: u64) -> b
         return session.caller_conn_id == Some(conn_id);
     }
     if session.callee_id == user_id {
-
         return session.phase == CallPhase::Accepted && session.callee_conn_id == Some(conn_id);
     }
     false

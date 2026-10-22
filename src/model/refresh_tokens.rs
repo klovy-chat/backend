@@ -91,8 +91,29 @@ impl RefreshToken {
 
     pub async fn revoke_by_id(db: &Database, id: ObjectId) -> mongodb::error::Result<()> {
         Self::collection(db)
+            .update_one(doc! { "_id": id }, doc! { "$set": { "revoked": true } })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn claim_for_rotation(db: &Database, id: ObjectId) -> mongodb::error::Result<bool> {
+        let result = Self::collection(db)
             .update_one(
-                doc! { "_id": id },
+                doc! {
+                    "_id": id,
+                    "revoked": false,
+                    "expiresAt": { "$gt": BsonDateTime::now() },
+                },
+                doc! { "$set": { "revoked": true } },
+            )
+            .await?;
+        Ok(result.matched_count == 1)
+    }
+
+    pub async fn revoke_by_hash(db: &Database, token_hash: &str) -> mongodb::error::Result<()> {
+        Self::collection(db)
+            .update_one(
+                doc! { "tokenHash": token_hash, "revoked": false },
                 doc! { "$set": { "revoked": true } },
             )
             .await?;
@@ -173,10 +194,7 @@ impl RefreshToken {
         Ok(count > 0)
     }
 
-    pub async fn family_is_active(
-        db: &Database,
-        family_id: &str,
-    ) -> mongodb::error::Result<bool> {
+    pub async fn family_is_active(db: &Database, family_id: &str) -> mongodb::error::Result<bool> {
         let now = BsonDateTime::now();
         let count = Self::collection(db)
             .count_documents(doc! {

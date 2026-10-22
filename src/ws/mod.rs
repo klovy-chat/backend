@@ -6,9 +6,9 @@
 // Nowy warunek odrzucenia: log + ten sam powód co HTTP gdy się da.
 // Przy zmianach: ws/handlers.rs, ws/registry.rs, middlewares/client.rs.
 
-pub mod keys;
 pub mod encrypt;
 pub mod handlers;
+pub mod keys;
 pub mod registry;
 pub mod state;
 pub mod typing;
@@ -31,25 +31,25 @@ use serde_json::json;
 use std::net::SocketAddr;
 use tokio::sync::{mpsc, watch};
 
-use crate::middlewares::ip_block::IPBlockerArc;
-use crate::utils::ip::client_ip_from_headers;
-use crate::utils::security::id::{query_client_valid, query_param, WS_CRYPTO_QUERY_PARAM};
-use crate::utils::security::origin::is_origin_header_allowed;
-use crate::utils::security::transport::is_secure_client_connection;
-use crate::ws::keys::{consume_ws_crypto_key, ws_frame_encryption_required};
-use crate::ws::encrypt::{decrypt_frame_async, encrypt_frame_async, FrameCipher};
-use crate::ws::handlers::{
-    dispatch_message, finalize_taken_call_sessions, on_user_connected, on_user_disconnected,
-};
-use crate::utils::voice::calls::take_sessions_for_connection;
-use crate::ws::registry::ConnectionRegistry;
-use crate::ws::state::{is_valid_object_id, SocketState};
 use crate::middlewares::auth::TokenPayload;
+use crate::middlewares::ip_block::IPBlockerArc;
 use crate::utils::auth::jwt::{
     jwt_decoding_key, parse_jwt_from_cookie_header, parse_refresh_from_cookie_header,
     resolve_session_family_id, user_from_jwt_with_refresh, JwtUserError,
 };
 use crate::utils::auth::validation::hs256_validation;
+use crate::utils::ip::client_ip_from_headers;
+use crate::utils::security::id::{query_client_valid, query_param, WS_CRYPTO_QUERY_PARAM};
+use crate::utils::security::origin::is_origin_header_allowed;
+use crate::utils::security::transport::is_secure_client_connection;
+use crate::utils::voice::calls::take_sessions_for_connection;
+use crate::ws::encrypt::{decrypt_frame_async, encrypt_frame_async, FrameCipher};
+use crate::ws::handlers::{
+    dispatch_message, finalize_taken_call_sessions, on_user_connected, on_user_disconnected,
+};
+use crate::ws::keys::{consume_ws_crypto_key, ws_frame_encryption_required};
+use crate::ws::registry::ConnectionRegistry;
+use crate::ws::state::{is_valid_object_id, SocketState};
 
 #[derive(Clone)]
 pub struct WsAppState {
@@ -90,7 +90,9 @@ pub async fn ws_handler(
         }
     };
 
-    if raw_query.as_deref().is_some_and(|q| q.len() > crate::utils::upload::MAX_PROXY_URI_BYTES)
+    if raw_query
+        .as_deref()
+        .is_some_and(|q| q.len() > crate::utils::upload::MAX_PROXY_URI_BYTES)
     {
         return (StatusCode::URI_TOO_LONG, "URI too long").into_response();
     }
@@ -114,12 +116,18 @@ pub async fn ws_handler(
 
     if !query_client_valid(raw_query.as_deref()) {
         app_state.ip_block.add_suspicious_activity(&client_ip);
-        log::warn!("WebSocket rejected — missing client identifier for IP {}", client_ip);
+        log::warn!(
+            "WebSocket rejected — missing client identifier for IP {}",
+            client_ip
+        );
         return (StatusCode::BAD_REQUEST, "Unsupported client").into_response();
     }
 
     if let Err(retry_after) = crate::utils::ratelimit::ws_handshake_allowed(&client_ip) {
-        log::warn!("WebSocket rejected — handshake rate limit for IP {}", client_ip);
+        log::warn!(
+            "WebSocket rejected — handshake rate limit for IP {}",
+            client_ip
+        );
         return (
             StatusCode::TOO_MANY_REQUESTS,
             [(header::RETRY_AFTER, retry_after.to_string())],
@@ -129,7 +137,10 @@ pub async fn ws_handler(
     }
 
     if !app_state.socket_state.can_accept_ip_connection(&client_ip) {
-        log::warn!("WebSocket rejected — too many connections from IP {}", client_ip);
+        log::warn!(
+            "WebSocket rejected — too many connections from IP {}",
+            client_ip
+        );
         return (
             StatusCode::TOO_MANY_REQUESTS,
             [(header::RETRY_AFTER, "60")],
@@ -148,13 +159,11 @@ pub async fn ws_handler(
     let (user_id, jwt_token) =
         if let Some(token) = cookie_header.and_then(|h| parse_jwt_from_cookie_header(h)) {
             match user_from_jwt_with_refresh(&token, refresh_ref).await {
-                Ok(user) => (
-                    user.id.map(|id| id.to_hex()).unwrap_or_default(),
-                    token,
-                ),
+                Ok(user) => (user.id.map(|id| id.to_hex()).unwrap_or_default(), token),
                 Err(JwtUserError::Unavailable) => {
                     log::warn!("WebSocket rejected — JWT user lookup unavailable");
-                    return (StatusCode::SERVICE_UNAVAILABLE, "Temporarily unavailable").into_response();
+                    return (StatusCode::SERVICE_UNAVAILABLE, "Temporarily unavailable")
+                        .into_response();
                 }
                 Err(JwtUserError::Denied) => (String::new(), String::new()),
             }
@@ -193,13 +202,19 @@ pub async fn ws_handler(
     let crypto_token = query_param(raw_query.as_deref(), WS_CRYPTO_QUERY_PARAM);
     let frame_key = if encryption_required {
         let Some(token) = crypto_token.as_deref() else {
-            log::warn!("WebSocket rejected — missing frame encryption token for user {}", user_id);
+            log::warn!(
+                "WebSocket rejected — missing frame encryption token for user {}",
+                user_id
+            );
             return (StatusCode::FORBIDDEN, "Encryption required").into_response();
         };
         match consume_ws_crypto_key(token, &user_id) {
             Some(key) => Some(key),
             None => {
-                log::warn!("WebSocket rejected — invalid frame encryption token for user {}", user_id);
+                log::warn!(
+                    "WebSocket rejected — invalid frame encryption token for user {}",
+                    user_id
+                );
                 return (StatusCode::FORBIDDEN, "Invalid encryption token").into_response();
             }
         }
@@ -231,7 +246,6 @@ async fn process_incoming_text(
     last_pong_at: &mut std::time::Instant,
     conn_id: u64,
 ) -> bool {
-
     if let Ok(parsed) = serde_json::from_str::<IncomingFrame>(text) {
         if parsed.msg_type == "pong" {
             *last_pong_at = std::time::Instant::now();
@@ -259,16 +273,16 @@ async fn handle_socket(
     app_state: WsAppState,
 ) {
     if !app_state.socket_state.register_ip_connection(&client_ip) {
-        log::warn!("WebSocket dropped after upgrade — connection cap for {}", client_ip);
+        log::warn!(
+            "WebSocket dropped after upgrade — connection cap for {}",
+            client_ip
+        );
         return;
     }
 
-    let Some(is_first_connection) = app_state.socket_state.register_connection(&user_id)
-    else {
+    let Some(is_first_connection) = app_state.socket_state.register_connection(&user_id) else {
         log::warn!("Too many connections for user {}", user_id);
-        app_state
-            .socket_state
-            .unregister_ip_connection(&client_ip);
+        app_state.socket_state.unregister_ip_connection(&client_ip);
         return;
     };
 
@@ -305,9 +319,7 @@ async fn handle_socket(
             log::error!("WebSocket frame cipher init failed for {}", user_id);
             app_state.registry.unregister(&user_id, conn_id).await;
             app_state.socket_state.unregister_connection(&user_id);
-            app_state
-                .socket_state
-                .unregister_ip_connection(&client_ip);
+            app_state.socket_state.unregister_ip_connection(&client_ip);
             return;
         }
     }
@@ -457,15 +469,12 @@ async fn handle_socket(
     }
     app_state.registry.unregister(&user_id, conn_id).await;
     app_state.socket_state.unregister_connection(&user_id);
-    app_state
-        .socket_state
-        .unregister_ip_connection(&client_ip);
+    app_state.socket_state.unregister_ip_connection(&client_ip);
 
     let last_connection = !app_state.socket_state.is_user_connected(&user_id);
 
     if !last_connection {
-        let voice_left =
-            crate::utils::voice::channels::clear_connection(&user_id, conn_id);
+        let voice_left = crate::utils::voice::channels::clear_connection(&user_id, conn_id);
         if !voice_left.is_empty() {
             let user_id_voice = user_id.clone();
             tokio::spawn(async move {

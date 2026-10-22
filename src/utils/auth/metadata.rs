@@ -9,9 +9,9 @@
 use actix_web::HttpRequest;
 
 use super::client::client_environment_from_request;
-use super::user_agent::user_agent_from_request;
-use super::session::resolve_client_info;
 use super::fingerprint::session_fingerprint_from_request;
+use super::session::resolve_client_info;
+use super::user_agent::user_agent_from_request;
 
 #[derive(Debug, Clone)]
 pub struct SessionClientMetadata {

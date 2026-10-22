@@ -53,12 +53,8 @@ impl ChannelReadState {
         )
         .await?;
 
-        col.create_index(
-            IndexModel::builder()
-                .keys(doc! { "channelId": 1 })
-                .build(),
-        )
-        .await?;
+        col.create_index(IndexModel::builder().keys(doc! { "channelId": 1 }).build())
+            .await?;
 
         Ok(())
     }
@@ -82,8 +78,7 @@ impl ChannelReadState {
 
         let now = DateTime::now();
 
-        let last_read =
-            DateTime::from_millis(now.timestamp_millis().saturating_sub(1));
+        let last_read = DateTime::from_millis(now.timestamp_millis().saturating_sub(1));
         Self::collection(db)
             .update_one(
                 doc! { "userId": user_id, "channelId": channel_id },
@@ -111,8 +106,7 @@ impl ChannelReadState {
     ) -> mongodb::error::Result<()> {
         use mongodb::options::UpdateOptions;
         let now = DateTime::now();
-        let watermark =
-            DateTime::from_millis(message_ts.timestamp_millis().saturating_sub(1));
+        let watermark = DateTime::from_millis(message_ts.timestamp_millis().saturating_sub(1));
         Self::collection(db)
             .update_one(
                 doc! { "userId": user_id, "channelId": channel_id },
@@ -145,12 +139,12 @@ impl ChannelReadState {
         let mut i = 0;
         while i < user_ids.len() {
             let end = (i + CHUNK).min(user_ids.len());
-            let batch = user_ids[i..end]
-                .iter()
-                .copied()
-                .map(|uid| async move {
-                    (uid, Self::bump_unread(db, uid, channel_id, message_ts).await)
-                });
+            let batch = user_ids[i..end].iter().copied().map(|uid| async move {
+                (
+                    uid,
+                    Self::bump_unread(db, uid, channel_id, message_ts).await,
+                )
+            });
             for (uid, res) in futures_util::future::join_all(batch).await {
                 if res.is_err() {
                     failed.push(uid);
@@ -169,8 +163,7 @@ impl ChannelReadState {
         use mongodb::options::UpdateOptions;
         let now = DateTime::now();
 
-        let last_read =
-            DateTime::from_millis(now.timestamp_millis().saturating_sub(1));
+        let last_read = DateTime::from_millis(now.timestamp_millis().saturating_sub(1));
         Self::collection(db)
             .update_one(
                 doc! { "userId": user_id, "channelId": channel_id },
@@ -180,6 +173,34 @@ impl ChannelReadState {
                         "lastReadAt": last_read,
                         "unreadCount": 0i64,
                         "updatedAt": now,
+                    },
+                },
+            )
+            .with_options(UpdateOptions::builder().upsert(true).build())
+            .await?;
+        Ok(())
+    }
+
+    pub async fn reset_for_rejoin(
+        db: &Database,
+        user_id: ObjectId,
+        channel_id: ObjectId,
+    ) -> mongodb::error::Result<()> {
+        use mongodb::options::UpdateOptions;
+
+        let now = DateTime::now();
+        let last_read = now;
+        Self::collection(db)
+            .update_one(
+                doc! { "userId": user_id, "channelId": channel_id },
+                doc! {
+                    "$set": {
+                        "lastReadAt": last_read,
+                        "unreadCount": 0i64,
+                        "updatedAt": now,
+                    },
+                    "$setOnInsert": {
+                        "createdAt": now,
                     },
                 },
             )

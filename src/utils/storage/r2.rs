@@ -51,9 +51,8 @@ pub struct R2Storage {
 static STORAGE: OnceLock<R2Storage> = OnceLock::new();
 
 fn required_env(name: &str) -> Result<String, StorageError> {
-    env::var(name).map_err(|_| {
-        StorageError::NotConfigured(format!("missing environment variable {name}"))
-    })
+    env::var(name)
+        .map_err(|_| StorageError::NotConfigured(format!("missing environment variable {name}")))
 }
 
 fn build_client() -> Result<Client, StorageError> {
@@ -97,8 +96,7 @@ fn is_not_found(err: &str) -> bool {
 fn is_missing_object(err: &(impl ProvideErrorMetadata + std::fmt::Debug)) -> bool {
     match err.code() {
         Some(code)
-            if code.eq_ignore_ascii_case("NotFound")
-                || code.eq_ignore_ascii_case("NoSuchKey") =>
+            if code.eq_ignore_ascii_case("NotFound") || code.eq_ignore_ascii_case("NoSuchKey") =>
         {
             true
         }
@@ -156,13 +154,11 @@ impl R2Storage {
         content_type: &str,
         public: bool,
     ) -> aws_sdk_s3::operation::put_object::builders::PutObjectFluentBuilder {
-        request = request
-            .content_type(content_type)
-            .cache_control(if public {
-                "public, max-age=31536000, immutable"
-            } else {
-                "private, no-store"
-            });
+        request = request.content_type(content_type).cache_control(if public {
+            "public, max-age=31536000, immutable"
+        } else {
+            "private, no-store"
+        });
         // R2/S3 cannot set X-Content-Type-Options (metadata is x-amz-meta-*, not an HTTP header).
         // Non-media: force download. Media: inline with a name taken only from the object key.
         if attachment_prefers_download(key) {
@@ -219,11 +215,19 @@ impl R2Storage {
         bucket: &str,
         key: &str,
     ) -> Result<Option<Vec<u8>>, StorageError> {
-        match self.client.get_object().bucket(bucket).key(key).send().await {
+        match self
+            .client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+        {
             Ok(output) => {
-                let aggregated = output.body.collect().await.map_err(|e| {
-                    StorageError::OperationFailed(format!("get body {key}: {e}"))
-                })?;
+                let aggregated =
+                    output.body.collect().await.map_err(|e| {
+                        StorageError::OperationFailed(format!("get body {key}: {e}"))
+                    })?;
                 Ok(Some(aggregated.into_bytes().to_vec()))
             }
             Err(err) => {
@@ -273,11 +277,11 @@ impl R2Storage {
         content_type: &str,
     ) -> Result<(), StorageError> {
         self.put_public(logical_key, body, content_type).await?;
-        let _ = self.delete_quarantine(logical_key).await;
+        self.delete_quarantine(logical_key).await?;
         if let Some(thumb) = crate::utils::storage::attachment_thumb_key(logical_key) {
-            if let Ok(Some(thumb_bytes)) = self.get_quarantine(&thumb).await {
-                let _ = self.put_public(&thumb, thumb_bytes, "image/webp").await;
-                let _ = self.delete_quarantine(&thumb).await;
+            if let Some(thumb_bytes) = self.get_quarantine(&thumb).await? {
+                self.put_public(&thumb, thumb_bytes, "image/webp").await?;
+                self.delete_quarantine(&thumb).await?;
             }
         }
         Ok(())
@@ -307,7 +311,9 @@ impl R2Storage {
                 if is_missing_object(&err) {
                     Ok(())
                 } else {
-                    Err(StorageError::OperationFailed(format!("delete {key}: {err:?}")))
+                    Err(StorageError::OperationFailed(format!(
+                        "delete {key}: {err:?}"
+                    )))
                 }
             }
         }
@@ -345,7 +351,9 @@ impl R2Storage {
                 if is_missing_object(&err) {
                     Ok(None)
                 } else {
-                    Err(StorageError::OperationFailed(format!("head {key}: {err:?}")))
+                    Err(StorageError::OperationFailed(format!(
+                        "head {key}: {err:?}"
+                    )))
                 }
             }
         }
@@ -356,7 +364,10 @@ impl R2Storage {
             return Ok(());
         }
         let mut first_error = None;
-        for result in [self.delete_public(key).await, self.delete_quarantine(key).await] {
+        for result in [
+            self.delete_public(key).await,
+            self.delete_quarantine(key).await,
+        ] {
             if let Err(error) = result {
                 first_error.get_or_insert(error);
             }
@@ -427,7 +438,9 @@ impl R2Storage {
     }
 
     pub async fn list_public_attachments(&self) -> Result<Vec<(String, u64)>, StorageError> {
-        let objects = self.list_prefix(&self.public_bucket, "attachments/").await?;
+        let objects = self
+            .list_prefix(&self.public_bucket, "attachments/")
+            .await?;
         Ok(objects
             .into_iter()
             .filter(|(key, _)| crate::utils::storage::is_attachment_key(key))

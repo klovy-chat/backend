@@ -51,15 +51,24 @@ pub fn signup_max_per_ip_hour() -> u32 {
     // person could lock out everyone else behind that IP, so some people could
     // sign up while others couldn't. Keep an anti-abuse ceiling but make it far
     // less likely to catch real users. Override with SIGNUP_MAX_PER_IP_HOUR.
-    env_u32("SIGNUP_MAX_PER_IP_HOUR", if is_production() { 8 } else { 20 })
+    env_u32(
+        "SIGNUP_MAX_PER_IP_HOUR",
+        if is_production() { 8 } else { 20 },
+    )
 }
 
 pub fn signup_max_global_per_hour() -> u64 {
-    env_u64("SIGNUP_MAX_GLOBAL_PER_HOUR", if is_production() { 25 } else { 200 })
+    env_u64(
+        "SIGNUP_MAX_GLOBAL_PER_HOUR",
+        if is_production() { 25 } else { 200 },
+    )
 }
 
 pub fn signup_max_global_per_day() -> u64 {
-    env_u64("SIGNUP_MAX_GLOBAL_PER_DAY", if is_production() { 100 } else { 1000 })
+    env_u64(
+        "SIGNUP_MAX_GLOBAL_PER_DAY",
+        if is_production() { 100 } else { 1000 },
+    )
 }
 
 pub fn is_registration_open() -> bool {
@@ -113,11 +122,7 @@ fn utc_window_keys(now: DateTime) -> (String, String) {
     (format!("hour:{hour}"), format!("day:{day}"))
 }
 
-async fn try_consume_window(
-    db: &Database,
-    key: &str,
-    max: u64,
-) -> mongodb::error::Result<bool> {
+async fn try_consume_window(db: &Database, key: &str, max: u64) -> mongodb::error::Result<bool> {
     let now = DateTime::now();
 
     // Increment unconditionally with a plain `_id` filter (which always matches an
@@ -158,9 +163,7 @@ async fn try_consume_window(
     Ok(false)
 }
 
-pub async fn try_consume_global_signup_slot(
-    db: &Database,
-) -> Result<(), SignupQuotaError> {
+pub async fn try_consume_global_signup_slot(db: &Database) -> Result<(), SignupQuotaError> {
     let now = DateTime::now();
     let (hour_key, day_key) = utc_window_keys(now);
 
@@ -177,7 +180,6 @@ pub async fn try_consume_global_signup_slot(
         Err(_) => return Err(SignupQuotaError::Unavailable),
     };
     if !day_ok {
-
         let _ = quota_collection(db)
             .update_one(
                 doc! { "_id": &hour_key, "count": { "$gt": 0 } },

@@ -10,21 +10,26 @@ use actix_multipart::form::{tempfile::TempFile, MultipartForm};
 use actix_web::web;
 use actix_web_lab::middleware::from_fn;
 
-use crate::controllers::auth::{
-    acknowledge_my_warnings, add_profile_banner, add_profile_image, change_password,
-    change_username, disable_account, disable_two_factor, enable_two_factor, get_my_warnings, get_user_info, list_sessions, login,
-    logout, refresh_session, registration_status, issue_ws_crypto_key, remove_profile_banner, remove_profile_image, request_account_deletion, cancel_account_deletion, revoke_all_sessions, revoke_other_sessions, revoke_session, setup_two_factor, signup,
-    update_language, update_profile, verify_two_factor_login,
-};
-use crate::middlewares::signup::registration_closed;
 use crate::controllers::announcements::{dismiss_announcements, get_my_announcements};
-use crate::middlewares::auth_fallback::{auth_fallback_guard_login, auth_fallback_guard_signup};
+use crate::controllers::auth::{
+    acknowledge_my_warnings, add_profile_banner, add_profile_image, cancel_account_deletion,
+    change_password, change_username, disable_account, disable_two_factor, enable_two_factor,
+    get_my_warnings, get_user_info, issue_ws_crypto_key, list_sessions, login, logout,
+    refresh_session, registration_status, remove_profile_banner, remove_profile_image,
+    request_account_deletion, revoke_all_sessions, revoke_other_sessions, revoke_session,
+    setup_two_factor, signup, update_language, update_profile, verify_two_factor_login,
+};
 use crate::middlewares::auth::{
     log_suspicious_activity, require_active_account, verify_token, verify_token_for_logout,
 };
+use crate::middlewares::auth_fallback::{auth_fallback_guard_login, auth_fallback_guard_signup};
 use crate::middlewares::captcha::verify_turnstile_token;
+use crate::middlewares::signup::registration_closed;
 use crate::middlewares::validation::validate_password;
-use crate::utils::ratelimit::{change_password_limiter, change_username_limiter, login_limiter, refresh_limiter, signup_limiter, two_factor_login_limiter, two_factor_mutation_limiter, upload_limiter};
+use crate::utils::ratelimit::{
+    change_password_limiter, change_username_limiter, login_limiter, refresh_limiter,
+    signup_limiter, two_factor_login_limiter, two_factor_mutation_limiter, upload_limiter,
+};
 
 #[derive(MultipartForm)]
 pub struct ProfileImageForm {
@@ -107,10 +112,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route(web::post().to(disable_two_factor)),
     );
 
-    cfg.service(
-        web::resource("/registration-status")
-            .route(web::get().to(registration_status)),
-    );
+    cfg.service(web::resource("/registration-status").route(web::get().to(registration_status)));
 
     cfg.service(
         web::resource("/ws-crypto")

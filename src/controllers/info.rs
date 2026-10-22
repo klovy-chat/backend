@@ -77,7 +77,6 @@ fn public_app_url() -> String {
 }
 
 fn captcha_feature() -> Value {
-
     let enabled = env_nonempty("TURNSTILE_SECRET_KEY").is_some()
         || env_nonempty("TURNSTILE_SITE_KEY").is_some();
     json!({
@@ -200,7 +199,6 @@ fn legal_links() -> Value {
 }
 
 fn build_info() -> Value {
-
     let mut build = json!({
         "semver": env!("CARGO_PKG_VERSION"),
         "timestamp": chrono::Utc::now().to_rfc3339(),

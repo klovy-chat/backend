@@ -34,7 +34,6 @@ struct FifoSlot {
 
 #[derive(Clone, Default)]
 pub struct SocketState {
-
     pub typing_users: Arc<StdMutex<HashMap<String, HashMap<String, i64>>>>,
 
     pub rate_limits: Arc<StdMutex<HashMap<String, HashMap<String, RateLimitEntry>>>>,
@@ -313,10 +312,12 @@ impl SocketState {
             limits.retain(|_, user_map| !user_map.is_empty());
         }
         let user_limits = limits.entry(user_id.to_string()).or_default();
-        let entry = user_limits.entry(action.to_string()).or_insert(RateLimitEntry {
-            count: 0,
-            reset_at_ms: now + window_ms,
-        });
+        let entry = user_limits
+            .entry(action.to_string())
+            .or_insert(RateLimitEntry {
+                count: 0,
+                reset_at_ms: now + window_ms,
+            });
 
         if now > entry.reset_at_ms {
             entry.count = 0;
@@ -344,7 +345,10 @@ impl SocketState {
         if self.ws_total.load(Ordering::Relaxed) >= MAX_GLOBAL_WS_CONNECTIONS {
             return false;
         }
-        let map = self.ip_connections.lock().unwrap_or_else(|e| e.into_inner());
+        let map = self
+            .ip_connections
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         map.get(ip).copied().unwrap_or(0) < MAX_CONNECTIONS_PER_IP
     }
 
@@ -363,7 +367,10 @@ impl SocketState {
             }
         }
 
-        let mut map = self.ip_connections.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = self
+            .ip_connections
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let count = map.entry(ip.to_string()).or_insert(0);
         if *count >= MAX_CONNECTIONS_PER_IP {
             self.ws_total.fetch_sub(1, Ordering::SeqCst);
@@ -374,7 +381,10 @@ impl SocketState {
     }
 
     pub fn unregister_ip_connection(&self, ip: &str) {
-        let mut map = self.ip_connections.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = self
+            .ip_connections
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let removed = match map.get_mut(ip) {
             Some(count) if *count <= 1 => {
                 map.remove(ip);

@@ -10,9 +10,7 @@ use mongodb::bson::oid::ObjectId;
 use mongodb::Database;
 
 use crate::model::channels::Channel;
-use crate::utils::channel::{
-    can_access_channel, is_channel_admin, is_channel_muted_member,
-};
+use crate::utils::channel::{can_access_channel, is_channel_admin, is_channel_muted_member};
 use crate::utils::friends::try_is_dm_blocked;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,21 +71,13 @@ pub async fn require_channel_access(
 
     match &result {
         Ok(channel) => {
-            crate::utils::access::cache::put_ok(
-                channel_id,
-                user_id,
-                channel.clone(),
-            );
+            crate::utils::access::cache::put_ok(channel_id, user_id, channel.clone());
         }
         Err(reason)
             if *reason != AccessDeniedReason::InvalidId
                 && *reason != AccessDeniedReason::Unavailable =>
         {
-            crate::utils::access::cache::put_err(
-                channel_id,
-                user_id,
-                reason.clone(),
-            );
+            crate::utils::access::cache::put_err(channel_id, user_id, reason.clone());
         }
         Err(_) => {}
     }
@@ -159,7 +149,6 @@ pub async fn require_message_participant(
         return Err(AccessDeniedReason::NotFound);
     }
     if let Some(channel_id) = msg.channel {
-
         require_channel_access(db, &channel_id.to_hex(), user_id).await?;
         return Ok(());
     }

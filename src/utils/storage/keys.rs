@@ -13,7 +13,10 @@ const ALLOWED_ATTACHMENT_EXTENSIONS: &[&str] = &[
 ];
 
 pub fn normalize_storage_key(path: &str) -> String {
-    path.trim().replace('\\', "/").trim_start_matches('/').to_string()
+    path.trim()
+        .replace('\\', "/")
+        .trim_start_matches('/')
+        .to_string()
 }
 
 pub fn is_safe_key(path: &str) -> bool {
@@ -156,7 +159,6 @@ fn is_object_id_hex(value: &str) -> bool {
 }
 
 fn attachment_filename_is_valid(filename: &str) -> bool {
-
     if let Some(stem) = filename.strip_suffix(".thumb.webp") {
         return uuid::Uuid::parse_str(stem).is_ok();
     }
@@ -247,8 +249,18 @@ pub fn attachment_stored_url_aliases(path: &str, cdn_base: &str) -> Vec<String> 
 fn attachment_is_inline_media(ext: &str) -> bool {
     matches!(
         ext,
-        "webp" | "jpg" | "jpeg" | "png" | "webm" | "ogg" | "wav" | "mp3" | "aac" | "mp4"
-            | "m4a" | "mov"
+        "webp"
+            | "jpg"
+            | "jpeg"
+            | "png"
+            | "webm"
+            | "ogg"
+            | "wav"
+            | "mp3"
+            | "aac"
+            | "mp4"
+            | "m4a"
+            | "mov"
     )
 }
 
@@ -270,13 +282,9 @@ pub fn content_type_for_ext(ext: &str) -> &'static str {
         "png" => "image/png",
         "gif" => "image/gif",
         "pdf" => "application/pdf",
-        "docx" => {
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        }
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        "pptx" => {
-            "application/vnd.openxmlformats-officedocument.presentationml.presentation"
-        }
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
         "txt" => "text/plain",
         "csv" => "text/csv",
         "webm" => "audio/webm",
@@ -305,6 +313,8 @@ mod tests {
         assert!(!attachment_prefers_download("attachments/dm/conv_a/x.webp"));
         assert!(!attachment_prefers_download("attachments/dm/conv_a/x.mp3"));
         assert!(!attachment_prefers_download("attachments/dm/conv_a/x.mp4"));
-        assert!(!attachment_prefers_download("attachments/dm/conv_a/x.thumb.webp"));
+        assert!(!attachment_prefers_download(
+            "attachments/dm/conv_a/x.thumb.webp"
+        ));
     }
 }

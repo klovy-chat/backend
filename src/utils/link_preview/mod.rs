@@ -6,22 +6,12 @@
 // SSRF: nie fetchuj RFC1918. Allowlista hostów w urls.rs.
 // Przy zmianach: controllers/messages.rs, embeds.ts.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
-use once_cell::sync::Lazy;
 use regex::Regex;
 use reqwest::redirect::Policy;
 use serde::Serialize;
-
-static PREVIEW_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
-    reqwest::Client::builder()
-        .redirect(Policy::none())
-        .timeout(Duration::from_secs(6))
-        .user_agent("KlovyChatLinkPreview/1.0")
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
-});
 
 const MAX_HTML_BYTES: usize = 512 * 1024;
 const MAX_PREVIEW_REDIRECTS: usize = 3;
@@ -92,21 +82,34 @@ fn host_is_blocked(host: &str) -> bool {
     false
 }
 
-async fn host_resolves_public(host: &str) -> bool {
+async fn host_resolves_public(host: &str, port: u16) -> Option<Vec<SocketAddr>> {
     if host_is_blocked(host) {
-        return false;
+        return None;
     }
-    let Ok(addrs) = tokio::net::lookup_host((host, 443)).await else {
-        return false;
+    let Ok(addrs) = tokio::net::lookup_host((host, port)).await else {
+        return None;
     };
-    let mut saw_any = false;
+    let mut public_addrs = Vec::new();
     for addr in addrs {
-        saw_any = true;
         if ip_is_disallowed(addr.ip()) {
-            return false;
+            return None;
         }
+        public_addrs.push(addr);
     }
-    saw_any
+    (!public_addrs.is_empty()).then_some(public_addrs)
+}
+
+fn client_for_resolved_host(
+    host: &str,
+    addrs: &[SocketAddr],
+) -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .redirect(Policy::none())
+        .timeout(Duration::from_secs(6))
+        .user_agent("KlovyChatLinkPreview/1.0")
+        .no_proxy()
+        .resolve_to_addrs(host, addrs)
+        .build()
 }
 
 pub fn is_safe_preview_target(url: &str) -> bool {
@@ -221,11 +224,16 @@ pub async fn fetch_link_preview(url: &str) -> Result<LinkPreview, &'static str> 
         let Some(host) = current.host_str().map(str::to_string) else {
             return Err("Invalid preview URL.");
         };
-        if !host_resolves_public(&host).await {
-            return Err("Invalid preview URL.");
-        }
+        let port = current
+            .port_or_known_default()
+            .ok_or("Invalid preview URL.")?;
+        let addrs = host_resolves_public(&host, port)
+            .await
+            .ok_or("Invalid preview URL.")?;
+        let client =
+            client_for_resolved_host(&host, &addrs).map_err(|_| "Failed to fetch preview.")?;
 
-        let response = PREVIEW_CLIENT
+        let response = client
             .get(current.clone())
             .header(reqwest::header::ACCEPT, "text/html,application/xhtml+xml")
             .send()
@@ -268,9 +276,7 @@ pub async fn fetch_link_preview(url: &str) -> Result<LinkPreview, &'static str> 
             .await
             .map_err(|err| match err {
                 crate::utils::http::LimitedBodyError::TooLarge => "Preview too large.",
-                crate::utils::http::LimitedBodyError::ReadFailed => {
-                    "Failed to read preview."
-                }
+                crate::utils::http::LimitedBodyError::ReadFailed => "Failed to read preview.",
             })?;
 
         let html = String::from_utf8_lossy(&bytes);

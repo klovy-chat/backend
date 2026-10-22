@@ -37,7 +37,12 @@ pub async fn check_channel_slowmode(
     }
 }
 
-pub fn record_channel_slowmode(user_id: &str, channel_id: &str, rate_limit_secs: u32, bypass: bool) {
+pub fn record_channel_slowmode(
+    user_id: &str,
+    channel_id: &str,
+    rate_limit_secs: u32,
+    bypass: bool,
+) {
     if bypass || rate_limit_secs == 0 {
         return;
     }

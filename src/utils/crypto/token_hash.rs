@@ -18,7 +18,9 @@ pub fn refresh_token_hmac_key() -> Result<Vec<u8>, String> {
         let key = key.trim();
         if !key.is_empty() {
             if crate::utils::env::is_production() && key.len() < 32 {
-                return Err("TOKEN_HASH_KEY must be at least 32 characters in production".to_string());
+                return Err(
+                    "TOKEN_HASH_KEY must be at least 32 characters in production".to_string(),
+                );
             }
             return Ok(key.as_bytes().to_vec());
         }

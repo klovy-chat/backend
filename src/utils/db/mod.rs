@@ -46,10 +46,7 @@ pub fn get_db() -> Database {
         .clone()
 }
 
-async fn drop_stale_indexes(
-    collection_name: &str,
-    stale: &[&str],
-) -> mongodb::error::Result<()> {
+async fn drop_stale_indexes(collection_name: &str, stale: &[&str]) -> mongodb::error::Result<()> {
     let db = get_db();
     let collection = db.collection::<mongodb::bson::Document>(collection_name);
 
@@ -88,7 +85,11 @@ pub async fn sync_user_indexes() -> mongodb::error::Result<()> {
     drop_stale_indexes("users", &["email_1", "role_1", "e2eEnabled_1"]).await?;
     drop_stale_indexes(
         "messages",
-        &["e2eEncrypted_1", "e2eVersion_1", "e2eEncrypted_1_e2eVersion_1"],
+        &[
+            "e2eEncrypted_1",
+            "e2eVersion_1",
+            "e2eEncrypted_1_e2eVersion_1",
+        ],
     )
     .await?;
     Ok(())

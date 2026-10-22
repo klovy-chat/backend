@@ -14,14 +14,14 @@ use uuid::Uuid;
 
 use crate::model::refresh_tokens::RefreshToken;
 use crate::model::users::User;
-use crate::utils::auth::session::{normalize_browser_name, resolved_os_label};
 use crate::utils::auth::metadata::SessionClientMetadata;
+use crate::utils::auth::session::{normalize_browser_name, resolved_os_label};
+use crate::utils::auth::tokens::{create_access_token, REFRESH_MAX_AGE_MS};
 use crate::utils::crypto::hmac::verify_hmac_sha256_hex;
 use crate::utils::crypto::token_hash::{
     hash_refresh_token_for_storage, is_legacy_refresh_hash, legacy_refresh_token_hash,
     refresh_token_hmac_key,
 };
-use crate::utils::auth::tokens::REFRESH_MAX_AGE_MS;
 use crate::utils::db::get_db;
 
 pub const REFRESH_COOKIE: &str = "refreshToken";
@@ -89,10 +89,7 @@ fn session_label(token: &RefreshToken) -> (String, String, String, bool) {
             .unwrap_or_else(|| "Nieznana przeglądarka".to_string()),
     );
     let ua = token.client_user_agent.as_deref().unwrap_or("");
-    let os = resolved_os_label(
-        token.client_os.as_deref().unwrap_or(""),
-        ua,
-    );
+    let os = resolved_os_label(token.client_os.as_deref().unwrap_or(""), ua);
     let label = os.clone();
     let is_known = token.client_browser.is_some() && browser != "Nieznana przeglądarka";
     (label, browser, os, is_known)
@@ -187,8 +184,8 @@ pub async fn issue_refresh_token(
 
 pub struct RotatedSession {
     pub user: User,
+    pub access_token: String,
     pub new_refresh_token: String,
-    pub family_id: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,27 +210,63 @@ pub async fn rotate_refresh_token(
     };
 
     if stored.revoked {
-        let _ = RefreshToken::revoke_family(&db, &stored.family_id).await;
-        let _ = User::invalidate_tokens(&db, stored.user_id).await;
+        let family_revoke = RefreshToken::revoke_family(&db, &stored.family_id).await;
+        let token_invalidation = User::invalidate_tokens(&db, stored.user_id).await;
+        if let Err(error) = &family_revoke {
+            log::error!(
+                "Failed to revoke refresh family after token reuse for user {}: {error}",
+                stored.user_id.to_hex()
+            );
+        }
+        if let Err(error) = &token_invalidation {
+            log::error!(
+                "Failed to invalidate access tokens after refresh-token reuse for user {}: {error}",
+                stored.user_id.to_hex()
+            );
+        }
         crate::ws::registry::revoke_session_remotely(&stored.user_id.to_hex(), &stored.family_id);
+        if family_revoke.is_err() || token_invalidation.is_err() {
+            return Err(RefreshAuthError::Unavailable);
+        }
         return Err(RefreshAuthError::Denied);
     }
 
-    if let Some(stored_fp) = stored.client_fingerprint.as_deref() {
-        match metadata.fingerprint.as_deref() {
-            Some(current) if crate::utils::auth::fingerprint::fingerprints_match(
-                stored_fp, current,
-            ) => {}
-            _ => {
-                let _ = RefreshToken::revoke_family(&db, &stored.family_id).await;
-                let _ = User::invalidate_tokens(&db, stored.user_id).await;
-                crate::ws::registry::revoke_session_remotely(&stored.user_id.to_hex(), &stored.family_id);
-                return Err(RefreshAuthError::Denied);
+    if let (Some(stored_fp), Some(current_fp)) = (
+        stored.client_fingerprint.as_deref(),
+        metadata.fingerprint.as_deref(),
+    ) {
+        let fingerprint_matches = crate::utils::auth::fingerprint::fingerprint_matches_session(
+            stored_fp,
+            stored.client_user_agent.as_deref(),
+            current_fp,
+            &metadata.user_agent,
+        );
+        if !fingerprint_matches {
+            if let Err(error) = RefreshToken::revoke_family(&db, &stored.family_id).await {
+                log::error!("Failed to revoke refresh family after fingerprint mismatch: {error}");
+                return Err(RefreshAuthError::Unavailable);
             }
+            crate::ws::registry::revoke_session_remotely(
+                &stored.user_id.to_hex(),
+                &stored.family_id,
+            );
+            return Err(RefreshAuthError::Denied);
         }
     } else {
         if let Some(id) = stored.id {
-            let _ = RefreshToken::revoke_by_id(&db, id).await;
+            if let Err(error) = RefreshToken::revoke_by_id(&db, id).await {
+                log::error!(
+                    "Failed to revoke refresh token with missing client fingerprint for user {}: {error}",
+                    stored.user_id.to_hex()
+                );
+                return Err(RefreshAuthError::Unavailable);
+            }
+        } else {
+            log::error!(
+                "Cannot revoke refresh token with missing client fingerprint for user {}: token has no id",
+                stored.user_id.to_hex()
+            );
+            return Err(RefreshAuthError::Unavailable);
         }
         return Err(RefreshAuthError::Denied);
     }
@@ -253,11 +286,18 @@ pub async fn rotate_refresh_token(
         return Err(RefreshAuthError::Denied);
     }
 
-    if let Some(id) = stored.id {
-        RefreshToken::revoke_by_id(&db, id)
-            .await
-            .map_err(|_| RefreshAuthError::Unavailable)?;
-    }
+    let family_id = stored.family_id.clone();
+    let access_token = create_access_token(
+        &db,
+        &user.username,
+        &stored.user_id.to_hex(),
+        Some(&family_id),
+    )
+    .await
+    .map_err(|error| {
+        log::error!("Failed to create access token before refresh rotation: {error}");
+        RefreshAuthError::Unavailable
+    })?;
 
     let new_raw = generate_raw_token();
     let new_hash =
@@ -288,7 +328,7 @@ pub async fn rotate_refresh_token(
     let new_doc = RefreshToken {
         id: None,
         user_id: stored.user_id,
-        token_hash: new_hash,
+        token_hash: new_hash.clone(),
         family_id: stored.family_id.clone(),
         expires_at: RefreshToken::bson_expiry(new_expires),
         created_at: stored.created_at,
@@ -305,6 +345,34 @@ pub async fn rotate_refresh_token(
         .await
         .map_err(|_| RefreshAuthError::Unavailable)?;
 
+    let Some(id) = stored.id else {
+        if let Err(error) = RefreshToken::revoke_by_hash(&db, &new_hash).await {
+            log::error!("Failed to invalidate unclaimable replacement refresh token: {error}");
+            return Err(RefreshAuthError::Unavailable);
+        }
+        return Err(RefreshAuthError::Denied);
+    };
+
+    let claimed = match RefreshToken::claim_for_rotation(&db, id).await {
+        Ok(claimed) => claimed,
+        Err(error) => {
+            log::error!("Failed to claim refresh token for rotation: {error}");
+            if let Err(cleanup_error) = RefreshToken::revoke_by_hash(&db, &new_hash).await {
+                log::error!(
+                    "Failed to invalidate replacement refresh token after claim error: {cleanup_error}"
+                );
+            }
+            return Err(RefreshAuthError::Unavailable);
+        }
+    };
+    if !claimed {
+        if let Err(error) = RefreshToken::revoke_by_hash(&db, &new_hash).await {
+            log::error!("Failed to invalidate losing replacement refresh token: {error}");
+            return Err(RefreshAuthError::Unavailable);
+        }
+        return Err(RefreshAuthError::Denied);
+    }
+
     if is_legacy_refresh_hash(&stored.token_hash) {
         log::info!(
             "Upgraded legacy refresh token hash to HMAC for user {}",
@@ -314,8 +382,8 @@ pub async fn rotate_refresh_token(
 
     Ok(RotatedSession {
         user,
+        access_token,
         new_refresh_token: new_raw,
-        family_id: stored.family_id,
     })
 }
 
@@ -359,10 +427,7 @@ pub async fn revoke_refresh_token_family(
     Ok(Some(stored.user_id))
 }
 
-pub async fn revoke_session_for_user(
-    user_id: ObjectId,
-    family_id: &str,
-) -> Result<bool, String> {
+pub async fn revoke_session_for_user(user_id: ObjectId, family_id: &str) -> Result<bool, String> {
     let db = get_db();
     let belongs = RefreshToken::family_belongs_to_user(&db, user_id, family_id)
         .await

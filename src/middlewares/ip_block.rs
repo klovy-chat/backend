@@ -46,7 +46,10 @@ impl IPBlockerArc {
     }
 
     pub fn is_blocked(&self, ip: &str) -> bool {
-        self.blocked_ips.lock().unwrap_or_else(|e| e.into_inner()).contains(ip)
+        self.blocked_ips
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(ip)
     }
 
     pub fn add_suspicious_activity(&self, ip: &str) {
@@ -54,7 +57,10 @@ impl IPBlockerArc {
         let block_duration = self.block_duration;
 
         let should_block = {
-            let mut map = self.suspicious_activity.lock().unwrap_or_else(|e| e.into_inner());
+            let mut map = self
+                .suspicious_activity
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             if map.len() >= 20_000 {
                 map.retain(|_, entry| now.duration_since(entry.last_activity) <= block_duration);
             }
@@ -95,11 +101,13 @@ impl IPBlockerArc {
 
         tokio::spawn(async move {
             sleep(duration).await;
-            blocked_arc.lock().unwrap_or_else(|e| e.into_inner()).remove(&ip_owned);
+            blocked_arc
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&ip_owned);
             log::info!("IP {} unblocked (timer expired)", ip_owned);
         });
     }
-
 }
 
 pub async fn ip_blocker_middleware(
@@ -146,7 +154,11 @@ pub async fn track_suspicious_activity(
         .unwrap_or("")
         .to_string();
 
-    let query_count = req.query_string().split('&').filter(|s| !s.is_empty()).count();
+    let query_count = req
+        .query_string()
+        .split('&')
+        .filter(|s| !s.is_empty())
+        .count();
 
     let is_suspicious = url.contains("..")
         || url.contains("<script")

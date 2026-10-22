@@ -15,15 +15,12 @@ use actix_web_lab::middleware::Next;
 
 use crate::middlewares::ip_block::IPBlockerArc;
 use crate::utils::ip::client_ip_from_service_request;
-use crate::utils::security::id::{
-    official_client_presented, CLIENT_HEADER_NAME,
-};
+use crate::utils::security::id::{official_client_presented, CLIENT_HEADER_NAME};
 
 pub async fn client_guard_middleware(
     req: ServiceRequest,
     next: Next<impl MessageBody + 'static>,
 ) -> Result<ServiceResponse<BoxBody>, actix_web::Error> {
-
     let path = req.path().to_string();
     let method = req.method().as_str().to_string();
     let query = req.query_string();

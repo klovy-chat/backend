@@ -6,6 +6,8 @@
 // Nowe pole widoczne w API: serde + frontend types/index.ts.
 // Przy zmianach: ws/handlers.rs, utils/crypto/encrypt.rs, messages/search.rs.
 
+use crate::model::scan::ScanStatus;
+use crate::utils::storage::{attachment_stored_url_aliases, cdn_public_base_url};
 use mongodb::{
     bson::{doc, oid::ObjectId, DateTime},
     options::IndexOptions,
@@ -13,9 +15,6 @@ use mongodb::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use crate::model::scan::ScanStatus;
-use crate::utils::storage::{attachment_stored_url_aliases, cdn_public_base_url};
-
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -65,10 +64,18 @@ pub struct Message {
 
     pub content: String,
 
-    #[serde(rename = "searchText", default, skip_serializing_if = "String::is_empty")]
+    #[serde(
+        rename = "searchText",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
     pub search_text: String,
 
-    #[serde(rename = "searchTokens", default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        rename = "searchTokens",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub search_tokens: Vec<String>,
 
     #[serde(rename = "messageType", default)]
@@ -154,8 +161,10 @@ impl std::fmt::Display for MessageValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let msg = match self {
             Self::ContentRequired => "Treść wiadomości jest wymagana",
-            Self::ContentTooLong  => "Wiadomość nie może przekraczać 2000 znaków",
-            Self::FileUrlRequired => "URL pliku jest wymagany dla wiadomości typu FILE, IMAGE, VIDEO lub AUDIO",
+            Self::ContentTooLong => "Wiadomość nie może przekraczać 2000 znaków",
+            Self::FileUrlRequired => {
+                "URL pliku jest wymagany dla wiadomości typu FILE, IMAGE, VIDEO lub AUDIO"
+            }
         };
         write!(f, "{}", msg)
     }
@@ -267,8 +276,9 @@ impl Message {
         let col = Self::collection(db);
 
         let indexes = vec![
-            IndexModel::builder().keys(doc! { "sender": 1, "recipient": 1 }).build(),
-
+            IndexModel::builder()
+                .keys(doc! { "sender": 1, "recipient": 1 })
+                .build(),
             IndexModel::builder()
                 .keys(doc! { "sender": 1, "recipient": 1, "_id": -1 })
                 .build(),
@@ -276,24 +286,31 @@ impl Message {
                 .keys(doc! { "recipient": 1, "sender": 1, "_id": -1 })
                 .build(),
             IndexModel::builder().keys(doc! { "channel": 1 }).build(),
-
             IndexModel::builder()
                 .keys(doc! { "channel": 1, "_id": -1 })
                 .build(),
-            IndexModel::builder().keys(doc! { "channel": 1, "pinned": 1 }).build(),
-            IndexModel::builder().keys(doc! { "sender": 1, "recipient": 1, "pinned": 1 }).build(),
+            IndexModel::builder()
+                .keys(doc! { "channel": 1, "pinned": 1 })
+                .build(),
+            IndexModel::builder()
+                .keys(doc! { "sender": 1, "recipient": 1, "pinned": 1 })
+                .build(),
             IndexModel::builder().keys(doc! { "timestamp": -1 }).build(),
-            IndexModel::builder().keys(doc! { "recipient": 1, "read": 1, "channel": 1, "deleted": 1 }).build(),
-            IndexModel::builder().keys(doc! { "channel": 1, "timestamp": -1, "sender": 1, "deleted": 1 }).build(),
-            IndexModel::builder().keys(doc! { "mentions": 1, "read": 1 }).build(),
-
+            IndexModel::builder()
+                .keys(doc! { "recipient": 1, "read": 1, "channel": 1, "deleted": 1 })
+                .build(),
+            IndexModel::builder()
+                .keys(doc! { "channel": 1, "timestamp": -1, "sender": 1, "deleted": 1 })
+                .build(),
+            IndexModel::builder()
+                .keys(doc! { "mentions": 1, "read": 1 })
+                .build(),
             IndexModel::builder()
                 .keys(doc! { "channel": 1, "messageType": 1, "searchTokens": 1 })
                 .build(),
             IndexModel::builder()
                 .keys(doc! { "sender": 1, "recipient": 1, "messageType": 1, "searchTokens": 1 })
                 .build(),
-
             IndexModel::builder()
                 .keys(doc! { "sender": 1, "clientNonce": 1 })
                 .options(
@@ -340,11 +357,10 @@ impl Message {
         }
 
         let trimmed = input.content.trim();
-        let stored_content = crate::utils::messages::storage::prepare_content_for_storage_async(
-            trimmed.to_string(),
-        )
-        .await
-        .map_err(|e| CreateMessageError::Other(e.into()))?;
+        let stored_content =
+            crate::utils::messages::storage::prepare_content_for_storage_async(trimmed.to_string())
+                .await
+                .map_err(|e| CreateMessageError::Other(e.into()))?;
         let msg_type = input.message_type.clone().unwrap_or_default();
         let search_index = if msg_type == MessageType::Text {
             crate::utils::messages::search::build_search_index_from_incoming(trimmed)
@@ -397,7 +413,6 @@ impl Message {
                 Ok(CreateMessageOutcome::Created(Message { id, ..msg }))
             }
             Err(e) => {
-
                 if let Some(ref nonce) = client_nonce {
                     if let Ok(Some(existing)) = Self::collection(db)
                         .find_one(doc! {
@@ -430,7 +445,11 @@ impl Message {
         let Some(id) = self.id else {
             return self;
         };
-        Self::find_by_id(db, id).await.ok().flatten().unwrap_or(self)
+        Self::find_by_id(db, id)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(self)
     }
 
     pub async fn soft_delete_active(

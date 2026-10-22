@@ -43,7 +43,11 @@ impl AuditLog {
             .create_index(IndexModel::builder().keys(doc! { "action": 1 }).build())
             .await?;
         Self::collection(db)
-            .create_index(IndexModel::builder().keys(doc! { "actorUserId": 1 }).build())
+            .create_index(
+                IndexModel::builder()
+                    .keys(doc! { "actorUserId": 1 })
+                    .build(),
+            )
             .await?;
         Ok(())
     }

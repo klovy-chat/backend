@@ -16,11 +16,9 @@ use crate::middlewares::auth::request_user_id;
 use crate::model::friend_requests::{FriendRequest, FriendRequestStatus};
 use crate::model::users::User;
 use crate::utils::db::get_db;
-use crate::utils::friends::{
-    invalidate_friend_ids_pair, map_friend_user, try_are_friends,
-};
-use crate::ws::typing;
+use crate::utils::friends::{invalidate_friend_ids_pair, map_friend_user, try_are_friends};
 use crate::utils::validators::username::normalize_username;
+use crate::ws::typing;
 
 const FRIEND_REQUEST_UNAVAILABLE: &str = "Nie można wysłać zaproszenia do tego użytkownika.";
 
@@ -38,6 +36,48 @@ fn status_str(status: &FriendRequestStatus) -> &'static str {
 
 fn iso(dt: &DateTime) -> Option<String> {
     dt.try_to_rfc3339_string().ok()
+}
+
+async fn reject_pending_friend_request(
+    col: &mongodb::Collection<FriendRequest>,
+    request_id: ObjectId,
+) -> Result<bool, String> {
+    match col
+        .update_one(
+            doc! { "_id": request_id, "status": "pending" },
+            doc! { "$set": { "status": "rejected", "updatedAt": DateTime::now() } },
+        )
+        .await
+    {
+        Ok(result) if result.modified_count > 0 => Ok(true),
+        Ok(_) => match col.find_one(doc! { "_id": request_id }).await {
+            Ok(Some(request)) => Ok(request.status == FriendRequestStatus::Rejected),
+            Ok(None) => Ok(false),
+            Err(error) => Err(format!("verify rejected friend request: {error}")),
+        },
+        Err(update_error) => match col.find_one(doc! { "_id": request_id }).await {
+            Ok(Some(request)) if request.status == FriendRequestStatus::Rejected => Ok(true),
+            Ok(_) => Err(format!("update rejected friend request: {update_error}")),
+            Err(read_error) => Err(format!(
+                "update rejected friend request: {update_error}; verify result: {read_error}"
+            )),
+        },
+    }
+}
+
+async fn friend_request_has_state(
+    col: &mongodb::Collection<FriendRequest>,
+    request_id: ObjectId,
+    from: ObjectId,
+    to: ObjectId,
+    status: FriendRequestStatus,
+) -> mongodb::error::Result<bool> {
+    Ok(col
+        .find_one(doc! { "_id": request_id })
+        .await?
+        .is_some_and(|request| {
+            request.from == from && request.to == to && request.status == status
+        }))
 }
 
 async fn fetch_users_map(
@@ -65,6 +105,183 @@ async fn fetch_users_map(
         }
     }
     Some(map)
+}
+
+async fn handle_existing_friend_request(
+    db: &mongodb::Database,
+    existing: FriendRequest,
+    sender_oid: ObjectId,
+    recipient_oid: ObjectId,
+    recipient: &User,
+) -> HttpResponse {
+    let Some(existing_id) = existing.id else {
+        return HttpResponse::InternalServerError().json(json!({
+            "error": "Internal Server Error",
+            "retryable": true,
+        }));
+    };
+    let pair_key = FriendRequest::pair_key(sender_oid, recipient_oid);
+    let col = FriendRequest::collection(db);
+
+    match existing.status {
+        FriendRequestStatus::Accepted => {
+            HttpResponse::BadRequest().json(json!({ "error": FRIEND_REQUEST_UNAVAILABLE }))
+        }
+        FriendRequestStatus::Pending if existing.from == recipient_oid => {
+            match col
+                .update_one(
+                    doc! {
+                        "_id": existing_id,
+                        "from": recipient_oid,
+                        "to": sender_oid,
+                        "status": "pending",
+                    },
+                    doc! { "$set": {
+                        "status": "accepted",
+                        "pairKey": pair_key,
+                        "updatedAt": DateTime::now(),
+                    }},
+                )
+                .await
+            {
+                Ok(result) if result.modified_count > 0 => {
+                    let sender_id = sender_oid.to_hex();
+                    let recipient_id = recipient_oid.to_hex();
+                    invalidate_friend_ids_pair(&sender_id, &recipient_id);
+                    typing::invalidate_pair(&sender_id, &recipient_id);
+                    HttpResponse::Ok().json(json!({
+                        "message": "Wzajemne zaproszenie — jesteście teraz znajomymi.",
+                        "autoAccepted": true,
+                        "friend": map_friend_user(recipient),
+                    }))
+                }
+                Ok(_) => {
+                    HttpResponse::BadRequest().json(json!({ "error": FRIEND_REQUEST_UNAVAILABLE }))
+                }
+                Err(update_error) => match friend_request_has_state(
+                    &col,
+                    existing_id,
+                    recipient_oid,
+                    sender_oid,
+                    FriendRequestStatus::Accepted,
+                )
+                .await
+                {
+                    Ok(true) => {
+                        let sender_id = sender_oid.to_hex();
+                        let recipient_id = recipient_oid.to_hex();
+                        invalidate_friend_ids_pair(&sender_id, &recipient_id);
+                        typing::invalidate_pair(&sender_id, &recipient_id);
+                        HttpResponse::Ok().json(json!({
+                            "message": "Wzajemne zaproszenie — jesteście teraz znajomymi.",
+                            "autoAccepted": true,
+                            "friend": map_friend_user(recipient),
+                        }))
+                    }
+                    Ok(false) => {
+                        log::error!(
+                            "Failed to auto-accept mutual friend request {existing_id}: {update_error}"
+                        );
+                        HttpResponse::ServiceUnavailable().json(json!({
+                            "error": "Temporarily unavailable",
+                            "retryable": true,
+                        }))
+                    }
+                    Err(read_error) => {
+                        log::error!(
+                            "Auto-accept friend request {existing_id} failed: {update_error}; verification failed: {read_error}"
+                        );
+                        HttpResponse::ServiceUnavailable().json(json!({
+                            "error": "Unable to confirm friend request acceptance.",
+                            "retryable": true,
+                            "outcomeUnknown": true,
+                        }))
+                    }
+                },
+            }
+        }
+        FriendRequestStatus::Pending if existing.from == sender_oid => {
+            HttpResponse::Ok().json(json!({
+                "message": "Zaproszenie wysłane.",
+                "request": {
+                    "_id": existing_id.to_hex(),
+                    "to": map_friend_user(recipient),
+                    "status": "pending",
+                    "createdAt": iso(&existing.created_at),
+                }
+            }))
+        }
+        FriendRequestStatus::Pending => {
+            HttpResponse::BadRequest().json(json!({ "error": FRIEND_REQUEST_UNAVAILABLE }))
+        }
+        FriendRequestStatus::Rejected => {
+            let now = DateTime::now();
+            match col
+                .update_one(
+                    doc! { "_id": existing_id, "status": "rejected" },
+                    doc! { "$set": {
+                        "from": sender_oid,
+                        "to": recipient_oid,
+                        "pairKey": pair_key,
+                        "status": "pending",
+                        "updatedAt": now,
+                    }},
+                )
+                .await
+            {
+                Ok(result) if result.matched_count > 0 => HttpResponse::Ok().json(json!({
+                    "message": "Zaproszenie wysłane.",
+                    "request": {
+                        "_id": existing_id.to_hex(),
+                        "to": map_friend_user(recipient),
+                        "status": "pending",
+                        "createdAt": iso(&existing.created_at),
+                    }
+                })),
+                Ok(_) => {
+                    HttpResponse::BadRequest().json(json!({ "error": FRIEND_REQUEST_UNAVAILABLE }))
+                }
+                Err(update_error) => match friend_request_has_state(
+                    &col,
+                    existing_id,
+                    sender_oid,
+                    recipient_oid,
+                    FriendRequestStatus::Pending,
+                )
+                .await
+                {
+                    Ok(true) => HttpResponse::Ok().json(json!({
+                        "message": "Zaproszenie wysłane.",
+                        "request": {
+                            "_id": existing_id.to_hex(),
+                            "to": map_friend_user(recipient),
+                            "status": "pending",
+                            "createdAt": iso(&existing.created_at),
+                        }
+                    })),
+                    Ok(false) => {
+                        log::error!(
+                            "Failed to resend friend request {existing_id}: {update_error}"
+                        );
+                        HttpResponse::ServiceUnavailable().json(json!({
+                            "error": "Temporarily unavailable",
+                            "retryable": true,
+                        }))
+                    }
+                    Err(read_error) => {
+                        log::error!(
+                            "Resend friend request {existing_id} failed: {update_error}; verification failed: {read_error}"
+                        );
+                        HttpResponse::ServiceUnavailable().json(json!({
+                            "error": "Unable to confirm friend request.",
+                            "retryable": true,
+                            "outcomeUnknown": true,
+                        }))
+                    }
+                },
+            }
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -102,12 +319,18 @@ pub async fn send_friend_request(
                 "error": FRIEND_REQUEST_UNAVAILABLE
             }))
         }
-        Err(_) => return HttpResponse::InternalServerError().json(json!({ "error": "Internal Server Error" })),
+        Err(_) => {
+            return HttpResponse::InternalServerError()
+                .json(json!({ "error": "Internal Server Error" }))
+        }
     };
 
     let recipient_oid = match recipient.id {
         Some(o) => o,
-        None => return HttpResponse::InternalServerError().json(json!({ "error": "Internal Server Error" })),
+        None => {
+            return HttpResponse::InternalServerError()
+                .json(json!({ "error": "Internal Server Error" }))
+        }
     };
     let recipient_id = recipient_oid.to_hex();
 
@@ -133,15 +356,13 @@ pub async fn send_friend_request(
     }
 
     let col = FriendRequest::collection(&db);
-    let existing = match col
-        .find_one(doc! {
-            "$or": [
-                { "from": sender_oid, "to": recipient_oid },
-                { "from": recipient_oid, "to": sender_oid },
-            ]
-        })
-        .await
-    {
+    let pair_filter = doc! {
+        "$or": [
+            { "from": sender_oid, "to": recipient_oid },
+            { "from": recipient_oid, "to": sender_oid },
+        ]
+    };
+    let existing = match col.find_one(pair_filter.clone()).await {
         Ok(v) => v,
         Err(_) => {
             return HttpResponse::ServiceUnavailable().json(json!({
@@ -152,79 +373,14 @@ pub async fn send_friend_request(
     };
 
     if let Some(existing) = existing {
-        let existing_id = existing.id.unwrap_or_default();
-        match existing.status {
-            FriendRequestStatus::Accepted => {
-                return HttpResponse::BadRequest()
-                    .json(json!({ "error": FRIEND_REQUEST_UNAVAILABLE }));
-            }
-            FriendRequestStatus::Pending => {
-                if existing.from == recipient_oid {
-                    match col
-                        .update_one(
-                            doc! { "_id": existing_id, "status": "pending" },
-                            doc! { "$set": { "status": "accepted", "updatedAt": DateTime::now() } },
-                        )
-                        .await
-                    {
-                        Ok(r) if r.modified_count > 0 => {}
-                        Ok(_) => {
-                            return HttpResponse::BadRequest().json(json!({
-                                "error": FRIEND_REQUEST_UNAVAILABLE
-                            }));
-                        }
-                        Err(_) => {
-                            return HttpResponse::InternalServerError().json(json!({
-                                "error": "Internal Server Error",
-                                "retryable": true,
-                            }));
-                        }
-                    }
-                    invalidate_friend_ids_pair(&sender_id, &recipient_oid.to_hex());
-                    typing::invalidate_pair(&sender_id, &recipient_oid.to_hex());
-                    return HttpResponse::Ok().json(json!({
-                        "message": "Wzajemne zaproszenie — jesteście teraz znajomymi.",
-                        "autoAccepted": true,
-                        "friend": map_friend_user(&recipient),
-                    }));
-                }
-                return HttpResponse::BadRequest().json(json!({
-                    "error": FRIEND_REQUEST_UNAVAILABLE
-                }));
-            }
-            FriendRequestStatus::Rejected => {
-                let now = DateTime::now();
-                match col
-                    .update_one(
-                        doc! { "_id": existing_id },
-                        doc! { "$set": {
-                            "from": sender_oid,
-                            "to": recipient_oid,
-                            "status": "pending",
-                            "updatedAt": now,
-                        }},
-                    )
-                    .await
-                {
-                    Ok(_) => {}
-                    Err(_) => {
-                        return HttpResponse::ServiceUnavailable().json(json!({
-                            "error": "Temporarily unavailable",
-                            "retryable": true,
-                        }));
-                    }
-                }
-                return HttpResponse::Ok().json(json!({
-                    "message": "Zaproszenie wysłane.",
-                    "request": {
-                        "_id": existing_id.to_hex(),
-                        "to": map_friend_user(&recipient),
-                        "status": "pending",
-                        "createdAt": iso(&existing.created_at),
-                    }
-                }));
-            }
-        }
+        return handle_existing_friend_request(
+            &db,
+            existing,
+            sender_oid,
+            recipient_oid,
+            &recipient,
+        )
+        .await;
     }
 
     match FriendRequest::create(&db, sender_oid, recipient_oid).await {
@@ -237,7 +393,18 @@ pub async fn send_friend_request(
                 "createdAt": iso(&request.created_at),
             }
         })),
-        Err(_) => HttpResponse::InternalServerError().json(json!({ "error": "Internal Server Error" })),
+        Err(_) => match col.find_one(pair_filter).await {
+            Ok(Some(existing)) => {
+                handle_existing_friend_request(&db, existing, sender_oid, recipient_oid, &recipient)
+                    .await
+            }
+            Ok(None) => HttpResponse::InternalServerError()
+                .json(json!({ "error": "Internal Server Error", "retryable": true })),
+            Err(_) => HttpResponse::ServiceUnavailable().json(json!({
+                "error": "Temporarily unavailable",
+                "retryable": true,
+            })),
+        },
     }
 }
 
@@ -262,7 +429,10 @@ pub async fn get_received_requests(req: HttpRequest) -> HttpResponse {
                     .json(json!({ "error": "Friends temporarily unavailable. Please retry." }));
             }
         },
-        Err(_) => return HttpResponse::InternalServerError().json(json!({ "error": "Internal Server Error" })),
+        Err(_) => {
+            return HttpResponse::InternalServerError()
+                .json(json!({ "error": "Internal Server Error" }))
+        }
     };
 
     let sender_ids: Vec<ObjectId> = requests.iter().map(|r| r.from).collect();
@@ -309,7 +479,10 @@ pub async fn get_sent_requests(req: HttpRequest) -> HttpResponse {
                     .json(json!({ "error": "Friends temporarily unavailable. Please retry." }));
             }
         },
-        Err(_) => return HttpResponse::InternalServerError().json(json!({ "error": "Internal Server Error" })),
+        Err(_) => {
+            return HttpResponse::InternalServerError()
+                .json(json!({ "error": "Internal Server Error" }))
+        }
     };
 
     let recipient_ids: Vec<ObjectId> = requests.iter().map(|r| r.to).collect();
@@ -348,34 +521,72 @@ pub async fn accept_friend_request(req: HttpRequest) -> HttpResponse {
     let col = FriendRequest::collection(&db);
     let request = match col.find_one(doc! { "_id": rid }).await {
         Ok(Some(r)) => r,
-        Ok(None) => return HttpResponse::NotFound().json(json!({ "error": "Zaproszenie nie istnieje." })),
-        Err(_) => return HttpResponse::InternalServerError().json(json!({ "error": "Internal Server Error" })),
+        Ok(None) => {
+            return HttpResponse::NotFound().json(json!({ "error": "Zaproszenie nie istnieje." }))
+        }
+        Err(_) => {
+            return HttpResponse::InternalServerError()
+                .json(json!({ "error": "Internal Server Error" }))
+        }
     };
 
     if request.to.to_hex() != user_id {
-        return HttpResponse::Forbidden().json(json!({ "error": "Brak uprawnień do tego zaproszenia." }));
+        return HttpResponse::Forbidden()
+            .json(json!({ "error": "Brak uprawnień do tego zaproszenia." }));
     }
-    if request.status != FriendRequestStatus::Pending {
-        return HttpResponse::BadRequest().json(json!({ "error": "To zaproszenie nie jest już aktywne." }));
+    if request.status != FriendRequestStatus::Pending
+        && request.status != FriendRequestStatus::Accepted
+    {
+        return HttpResponse::BadRequest()
+            .json(json!({ "error": "To zaproszenie nie jest już aktywne." }));
     }
 
-    match col
-        .update_one(
-            doc! { "_id": rid, "status": "pending" },
-            doc! { "$set": { "status": "accepted", "updatedAt": DateTime::now() } },
-        )
-        .await
-    {
-        Ok(r) if r.modified_count > 0 => {}
-        Ok(_) => {
-            return HttpResponse::BadRequest()
-                .json(json!({ "error": "To zaproszenie nie jest już aktywne." }));
-        }
-        Err(_) => {
-            return HttpResponse::InternalServerError().json(json!({
-                "error": "Internal Server Error",
-                "retryable": true,
-            }));
+    if request.status == FriendRequestStatus::Pending {
+        match col
+            .update_one(
+                doc! { "_id": rid, "status": "pending" },
+                doc! { "$set": { "status": "accepted", "updatedAt": DateTime::now() } },
+            )
+            .await
+        {
+            Ok(r) if r.modified_count > 0 => {}
+            Ok(_) => match col.find_one(doc! { "_id": rid }).await {
+                Ok(Some(updated)) if updated.status == FriendRequestStatus::Accepted => {}
+                Ok(_) => {
+                    return HttpResponse::BadRequest()
+                        .json(json!({ "error": "To zaproszenie nie jest już aktywne." }));
+                }
+                Err(error) => {
+                    log::error!(
+                            "Failed to verify friend request {rid} after concurrent acceptance: {error}"
+                        );
+                    return HttpResponse::ServiceUnavailable().json(json!({
+                        "error": "Friend request acceptance status is temporarily unavailable.",
+                        "retryable": true,
+                    }));
+                }
+            },
+            Err(error) => {
+                log::error!("Failed to accept friend request {rid}: {error}");
+                match col.find_one(doc! { "_id": rid }).await {
+                    Ok(Some(updated)) if updated.status == FriendRequestStatus::Accepted => {}
+                    Ok(_) => {
+                        return HttpResponse::ServiceUnavailable().json(json!({
+                            "error": "Friend request acceptance status is temporarily unavailable.",
+                            "retryable": true,
+                        }));
+                    }
+                    Err(verify_error) => {
+                        log::error!(
+                            "Failed to verify friend request {rid} after acceptance error: {verify_error}"
+                        );
+                        return HttpResponse::ServiceUnavailable().json(json!({
+                            "error": "Friend request acceptance status is temporarily unavailable.",
+                            "retryable": true,
+                        }));
+                    }
+                }
+            }
         }
     }
 
@@ -383,7 +594,6 @@ pub async fn accept_friend_request(req: HttpRequest) -> HttpResponse {
     typing::invalidate_pair(&user_id, &request.from.to_hex());
 
     let Ok(accepter_oid) = ObjectId::parse_str(&user_id) else {
-
         let from_hex = request.from.to_hex();
         crate::ws::registry::emit_to_user(
             &user_id,
@@ -407,15 +617,9 @@ pub async fn accept_friend_request(req: HttpRequest) -> HttpResponse {
     let from_hex = request.from.to_hex();
     let (friend_for_accepter, friend_for_requester) = match (from_user, accepter) {
         (Ok(Some(from_user)), Ok(Some(accepter))) => {
-            (
-                map_friend_user(&from_user),
-                map_friend_user(&accepter),
-            )
+            (map_friend_user(&from_user), map_friend_user(&accepter))
         }
-        _ => (
-            json!({ "_id": from_hex }),
-            json!({ "_id": user_id }),
-        ),
+        _ => (json!({ "_id": from_hex }), json!({ "_id": user_id })),
     };
     crate::ws::registry::emit_to_user(
         &user_id,
@@ -447,33 +651,39 @@ pub async fn reject_friend_request(req: HttpRequest) -> HttpResponse {
     let col = FriendRequest::collection(&db);
     let request = match col.find_one(doc! { "_id": rid }).await {
         Ok(Some(r)) => r,
-        Ok(None) => return HttpResponse::NotFound().json(json!({ "error": "Zaproszenie nie istnieje." })),
-        Err(_) => return HttpResponse::InternalServerError().json(json!({ "error": "Internal Server Error" })),
+        Ok(None) => {
+            return HttpResponse::NotFound().json(json!({ "error": "Zaproszenie nie istnieje." }))
+        }
+        Err(_) => {
+            return HttpResponse::InternalServerError()
+                .json(json!({ "error": "Internal Server Error" }))
+        }
     };
 
     if request.to.to_hex() != user_id {
-        return HttpResponse::Forbidden().json(json!({ "error": "Brak uprawnień do tego zaproszenia." }));
+        return HttpResponse::Forbidden()
+            .json(json!({ "error": "Brak uprawnień do tego zaproszenia." }));
+    }
+    if request.status == FriendRequestStatus::Rejected {
+        return HttpResponse::Ok().json(json!({ "message": "Zaproszenie odrzucone." }));
     }
     if request.status != FriendRequestStatus::Pending {
-        return HttpResponse::BadRequest().json(json!({ "error": "To zaproszenie nie jest już aktywne." }));
+        return HttpResponse::BadRequest()
+            .json(json!({ "error": "To zaproszenie nie jest już aktywne." }));
     }
 
-    match col
-        .update_one(
-            doc! { "_id": rid, "status": "pending" },
-            doc! { "$set": { "status": "rejected", "updatedAt": DateTime::now() } },
-        )
-        .await
-    {
-        Ok(r) if r.modified_count > 0 => {}
-        Ok(_) => {
+    match reject_pending_friend_request(&col, rid).await {
+        Ok(true) => {}
+        Ok(false) => {
             return HttpResponse::BadRequest()
                 .json(json!({ "error": "To zaproszenie nie jest już aktywne." }));
         }
-        Err(_) => {
-            return HttpResponse::InternalServerError().json(json!({
-                "error": "Internal Server Error",
+        Err(error) => {
+            log::error!("Failed to reject friend request {rid}: {error}");
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "error": "Unable to confirm friend request rejection.",
                 "retryable": true,
+                "outcomeUnknown": true,
             }));
         }
     }
@@ -494,33 +704,39 @@ pub async fn cancel_friend_request(req: HttpRequest) -> HttpResponse {
     let col = FriendRequest::collection(&db);
     let request = match col.find_one(doc! { "_id": rid }).await {
         Ok(Some(r)) => r,
-        Ok(None) => return HttpResponse::NotFound().json(json!({ "error": "Zaproszenie nie istnieje." })),
-        Err(_) => return HttpResponse::InternalServerError().json(json!({ "error": "Internal Server Error" })),
+        Ok(None) => {
+            return HttpResponse::NotFound().json(json!({ "error": "Zaproszenie nie istnieje." }))
+        }
+        Err(_) => {
+            return HttpResponse::InternalServerError()
+                .json(json!({ "error": "Internal Server Error" }))
+        }
     };
 
     if request.from.to_hex() != user_id {
-        return HttpResponse::Forbidden().json(json!({ "error": "Brak uprawnień do tego zaproszenia." }));
+        return HttpResponse::Forbidden()
+            .json(json!({ "error": "Brak uprawnień do tego zaproszenia." }));
+    }
+    if request.status == FriendRequestStatus::Rejected {
+        return HttpResponse::Ok().json(json!({ "message": "Zaproszenie anulowane." }));
     }
     if request.status != FriendRequestStatus::Pending {
-        return HttpResponse::BadRequest().json(json!({ "error": "To zaproszenie nie jest już aktywne." }));
+        return HttpResponse::BadRequest()
+            .json(json!({ "error": "To zaproszenie nie jest już aktywne." }));
     }
 
-    match col
-        .update_one(
-            doc! { "_id": rid, "status": "pending" },
-            doc! { "$set": { "status": "rejected", "updatedAt": DateTime::now() } },
-        )
-        .await
-    {
-        Ok(r) if r.modified_count > 0 => {}
-        Ok(_) => {
+    match reject_pending_friend_request(&col, rid).await {
+        Ok(true) => {}
+        Ok(false) => {
             return HttpResponse::BadRequest()
                 .json(json!({ "error": "To zaproszenie nie jest już aktywne." }));
         }
-        Err(_) => {
-            return HttpResponse::InternalServerError().json(json!({
-                "error": "Internal Server Error",
+        Err(error) => {
+            log::error!("Failed to cancel friend request {rid}: {error}");
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "error": "Unable to confirm friend request cancellation.",
                 "retryable": true,
+                "outcomeUnknown": true,
             }));
         }
     }
@@ -549,7 +765,10 @@ pub async fn get_friends(req: HttpRequest) -> HttpResponse {
                     .json(json!({ "error": "Friends temporarily unavailable. Please retry." }));
             }
         },
-        Err(_) => return HttpResponse::InternalServerError().json(json!({ "error": "Internal Server Error" })),
+        Err(_) => {
+            return HttpResponse::InternalServerError()
+                .json(json!({ "error": "Internal Server Error" }))
+        }
     };
 
     let ordered_ids: Vec<ObjectId> = friendships
@@ -727,6 +946,31 @@ pub async fn remove_friend(req: HttpRequest) -> HttpResponse {
     use crate::model::messages::Message;
     use crate::utils::messages::access::cleanup_attachment_if_unreferenced;
 
+    let _deletion_guard = match crate::utils::messages::conversation_writes::claim_deletion(
+        &db, user_oid, friend_oid,
+    )
+    .await
+    {
+        Ok(Some(guard)) => guard,
+        Ok(None) => {
+            return HttpResponse::Conflict().json(json!({
+                "error": "Conversation is already being modified. Retry shortly.",
+                "retryable": true,
+            }));
+        }
+        Err(error) => {
+            log::error!(
+                "remove_friend: failed to claim conversation {} / {}: {error}",
+                user_id,
+                friend_user_id
+            );
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "error": "Temporarily unavailable",
+                "retryable": true,
+            }));
+        }
+    };
+
     let wipe_at = DateTime::now();
     let conversation_filter = doc! {
         "$or": [
@@ -734,38 +978,12 @@ pub async fn remove_friend(req: HttpRequest) -> HttpResponse {
             { "sender": friend_oid, "recipient": user_oid },
         ],
     };
-    let mut file_urls = match crate::utils::messages::search::message_file_urls(
-        &db,
-        conversation_filter,
-    )
-    .await
-    {
-        Ok(urls) => urls,
-        Err(e) => {
-            log::error!(
-                "remove_friend: failed to read attachment URLs for {} / {}: {e}",
-                user_id,
-                friend_user_id
-            );
-            return HttpResponse::ServiceUnavailable().json(json!({
-                "error": "Failed to remove friend",
-                "retryable": true,
-            }));
-        }
-    };
-    let dm_filter = doc! {
-        "$or": [
-            { "sender": user_oid, "recipient": friend_oid },
-            { "sender": friend_oid, "recipient": user_oid },
-        ],
-        "deleted": { "$ne": true },
-    };
-    let live_file_urls =
-        match crate::utils::messages::search::wipe_live_messages(&db, dm_filter).await {
+    let mut file_urls =
+        match crate::utils::messages::search::message_file_urls(&db, conversation_filter).await {
             Ok(urls) => urls,
             Err(e) => {
                 log::error!(
-                    "remove_friend: failed to wipe DM messages for {} / {}: {e}",
+                    "remove_friend: failed to read attachment URLs for {} / {}: {e}",
                     user_id,
                     friend_user_id
                 );
@@ -775,37 +993,121 @@ pub async fn remove_friend(req: HttpRequest) -> HttpResponse {
                 }));
             }
         };
-    file_urls.extend(live_file_urls);
+    let friendship_id = match friendship.id {
+        Some(id) => id,
+        None => {
+            log::error!(
+                "remove_friend: accepted friendship has no document id for {} / {}",
+                user_id,
+                friend_user_id
+            );
+            return HttpResponse::InternalServerError().json(json!({
+                "error": "Failed to remove friend",
+            }));
+        }
+    };
+    let friendship_delete_result = col.delete_one(doc! { "_id": friendship_id }).await;
+    let friendship_removed = match friendship_delete_result {
+        Ok(result) if result.deleted_count > 0 => true,
+        Ok(_) => match col
+            .find_one(doc! {
+                "_id": friendship_id,
+                "status": "accepted",
+            })
+            .await
+        {
+            Ok(None) => true,
+            Ok(Some(_)) => false,
+            Err(error) => {
+                log::error!(
+                    "remove_friend: failed to verify friendship state for {} / {}: {error}",
+                    user_id,
+                    friend_user_id
+                );
+                return HttpResponse::ServiceUnavailable().json(json!({
+                    "error": "Unable to confirm friend removal",
+                    "retryable": true,
+                    "outcomeUnknown": true,
+                }));
+            }
+        },
+        Err(delete_error) => match col
+            .find_one(doc! {
+                "_id": friendship_id,
+                "status": "accepted",
+            })
+            .await
+        {
+            Ok(None) => true,
+            Ok(Some(_)) => {
+                log::error!(
+                    "remove_friend: friendship deletion failed for {} / {}: {delete_error}",
+                    user_id,
+                    friend_user_id
+                );
+                false
+            }
+            Err(read_error) => {
+                log::error!(
+                    "remove_friend: deletion failed for {} / {}: {delete_error}; verification failed: {read_error}",
+                    user_id,
+                    friend_user_id
+                );
+                return HttpResponse::ServiceUnavailable().json(json!({
+                    "error": "Unable to confirm friend removal",
+                    "retryable": true,
+                    "outcomeUnknown": true,
+                }));
+            }
+        },
+    };
+    if !friendship_removed {
+        return HttpResponse::ServiceUnavailable().json(json!({
+            "error": "Failed to remove friend",
+            "retryable": true,
+        }));
+    }
+
+    let dm_filter = doc! {
+        "$or": [
+            { "sender": user_oid, "recipient": friend_oid },
+            { "sender": friend_oid, "recipient": user_oid },
+        ],
+        "deleted": { "$ne": true },
+    };
+    let wipe_result = match crate::utils::messages::search::wipe_live_messages(&db, dm_filter).await
+    {
+        Ok(result) => result,
+        Err(e) => {
+            log::error!(
+                "remove_friend: failed to wipe DM messages for {} / {}: {e}",
+                user_id,
+                friend_user_id
+            );
+            crate::utils::messages::search::WipeLiveMessagesResult {
+                file_urls: Vec::new(),
+                wipe_pending: true,
+            }
+        }
+    };
+    let wipe_pending = wipe_result.wipe_pending;
+    file_urls.extend(wipe_result.file_urls);
     file_urls.sort();
     file_urls.dedup();
     let cleanups: Vec<_> = file_urls
         .iter()
         .map(|url| cleanup_attachment_if_unreferenced(&db, Some(url)))
         .collect();
+    let mut cleanup_pending = false;
     for result in futures_util::future::join_all(cleanups).await {
         if let Err(e) = result {
-            log::error!("Failed to clean up removed friendship attachment: {e}");
-            return HttpResponse::ServiceUnavailable().json(json!({
-                "error": "Messages were deleted, but attachment cleanup is incomplete.",
-                "retryable": true,
-            }));
+            log::error!(
+                "Failed to clean up removed friendship attachment; reconciliation will retry: {e}"
+            );
+            cleanup_pending = true;
         }
     }
     crate::utils::tips::clear_dm_tip_at_most(&db, user_oid, friend_oid, wipe_at).await;
-
-    match col.delete_one(doc! { "_id": friendship.id.unwrap_or_default() }).await {
-        Ok(r) if r.deleted_count > 0 => {}
-        Ok(_) => {
-            return HttpResponse::NotFound()
-                .json(json!({ "error": "Ten użytkownik nie jest w Twoich kontaktach." }));
-        }
-        Err(_) => {
-            return HttpResponse::InternalServerError().json(json!({
-                "error": "Failed to remove friend",
-                "retryable": true,
-            }));
-        }
-    }
 
     invalidate_friend_ids_pair(&user_id, friend_user_id);
     typing::invalidate_pair(&user_id, friend_user_id);
@@ -833,11 +1135,7 @@ pub async fn remove_friend(req: HttpRequest) -> HttpResponse {
                     "call:ended",
                     end_payload.clone(),
                 );
-                crate::ws::registry::emit_to_user(
-                    &session.caller_id,
-                    "call:ended",
-                    end_payload,
-                );
+                crate::ws::registry::emit_to_user(&session.caller_id, "call:ended", end_payload);
             }
         }
     }
@@ -882,35 +1180,40 @@ pub async fn remove_friend(req: HttpRequest) -> HttpResponse {
                     }
                 }
 
-                let synced_viewer = crate::utils::tips::try_sync_dm_tip_unread(
-                    &db, user_oid, friend_oid,
-                )
-                .await;
-                let synced_peer = crate::utils::tips::try_sync_dm_tip_unread(
-                    &db, friend_oid, user_oid,
-                )
-                .await;
+                let synced_viewer =
+                    crate::utils::tips::try_sync_dm_tip_unread(&db, user_oid, friend_oid).await;
+                let synced_peer =
+                    crate::utils::tips::try_sync_dm_tip_unread(&db, friend_oid, user_oid).await;
                 match (synced_viewer, synced_peer) {
                     (Some(nv), Some(np)) => {
                         crate::utils::unread::emit_unread_absolute(
-                            &user_id, "dm", friend_user_id, nv,
+                            &user_id,
+                            "dm",
+                            friend_user_id,
+                            nv,
                         );
                         crate::utils::unread::emit_unread_absolute(
-                            friend_user_id, "dm", &user_id, np,
+                            friend_user_id,
+                            "dm",
+                            &user_id,
+                            np,
                         );
                     }
                     _ => {
                         crate::utils::unread::invalidate_unread_generation(
-                            &user_id, "dm", friend_user_id,
+                            &user_id,
+                            "dm",
+                            friend_user_id,
                         );
                         crate::utils::unread::invalidate_unread_generation(
-                            friend_user_id, "dm", &user_id,
+                            friend_user_id,
+                            "dm",
+                            &user_id,
                         );
                     }
                 }
             }
             Ok(_) => {
-
                 match Message::collection(&db)
                     .count_documents(doc! {
                         "$or": [
@@ -922,7 +1225,6 @@ pub async fn remove_friend(req: HttpRequest) -> HttpResponse {
                     .await
                 {
                     Ok(0) => {
-
                         let still_empty = Message::collection(&db)
                             .count_documents(doc! {
                                 "$or": [
@@ -935,31 +1237,39 @@ pub async fn remove_friend(req: HttpRequest) -> HttpResponse {
                             .ok()
                             == Some(0);
                         if still_empty {
-                            let synced_viewer =
-                                crate::utils::tips::try_sync_dm_tip_unread(
-                                    &db, user_oid, friend_oid,
-                                )
-                                .await;
-                            let synced_peer =
-                                crate::utils::tips::try_sync_dm_tip_unread(
-                                    &db, friend_oid, user_oid,
-                                )
-                                .await;
+                            let synced_viewer = crate::utils::tips::try_sync_dm_tip_unread(
+                                &db, user_oid, friend_oid,
+                            )
+                            .await;
+                            let synced_peer = crate::utils::tips::try_sync_dm_tip_unread(
+                                &db, friend_oid, user_oid,
+                            )
+                            .await;
                             match (synced_viewer, synced_peer) {
                                 (Some(nv), Some(np)) => {
                                     crate::utils::unread::emit_unread_absolute(
-                                        &user_id, "dm", friend_user_id, nv,
+                                        &user_id,
+                                        "dm",
+                                        friend_user_id,
+                                        nv,
                                     );
                                     crate::utils::unread::emit_unread_absolute(
-                                        friend_user_id, "dm", &user_id, np,
+                                        friend_user_id,
+                                        "dm",
+                                        &user_id,
+                                        np,
                                     );
                                 }
                                 _ => {
                                     crate::utils::unread::invalidate_unread_generation(
-                                        &user_id, "dm", friend_user_id,
+                                        &user_id,
+                                        "dm",
+                                        friend_user_id,
                                     );
                                     crate::utils::unread::invalidate_unread_generation(
-                                        friend_user_id, "dm", &user_id,
+                                        friend_user_id,
+                                        "dm",
+                                        &user_id,
                                     );
                                 }
                             }
@@ -974,31 +1284,39 @@ pub async fn remove_friend(req: HttpRequest) -> HttpResponse {
                                 json!({ "contactId": user_id }),
                             );
                         } else {
-                            let synced_viewer =
-                                crate::utils::tips::try_sync_dm_tip_unread(
-                                    &db, user_oid, friend_oid,
-                                )
-                                .await;
-                            let synced_peer =
-                                crate::utils::tips::try_sync_dm_tip_unread(
-                                    &db, friend_oid, user_oid,
-                                )
-                                .await;
+                            let synced_viewer = crate::utils::tips::try_sync_dm_tip_unread(
+                                &db, user_oid, friend_oid,
+                            )
+                            .await;
+                            let synced_peer = crate::utils::tips::try_sync_dm_tip_unread(
+                                &db, friend_oid, user_oid,
+                            )
+                            .await;
                             match (synced_viewer, synced_peer) {
                                 (Some(nv), Some(np)) => {
                                     crate::utils::unread::emit_unread_absolute(
-                                        &user_id, "dm", friend_user_id, nv,
+                                        &user_id,
+                                        "dm",
+                                        friend_user_id,
+                                        nv,
                                     );
                                     crate::utils::unread::emit_unread_absolute(
-                                        friend_user_id, "dm", &user_id, np,
+                                        friend_user_id,
+                                        "dm",
+                                        &user_id,
+                                        np,
                                     );
                                 }
                                 _ => {
                                     crate::utils::unread::invalidate_unread_generation(
-                                        &user_id, "dm", friend_user_id,
+                                        &user_id,
+                                        "dm",
+                                        friend_user_id,
                                     );
                                     crate::utils::unread::invalidate_unread_generation(
-                                        friend_user_id, "dm", &user_id,
+                                        friend_user_id,
+                                        "dm",
+                                        &user_id,
                                     );
                                 }
                             }
@@ -1006,55 +1324,64 @@ pub async fn remove_friend(req: HttpRequest) -> HttpResponse {
                     }
                     Ok(_) => {
                         let synced_viewer =
-                            crate::utils::tips::try_sync_dm_tip_unread(
-                                &db, user_oid, friend_oid,
-                            )
-                            .await;
+                            crate::utils::tips::try_sync_dm_tip_unread(&db, user_oid, friend_oid)
+                                .await;
                         let synced_peer =
-                            crate::utils::tips::try_sync_dm_tip_unread(
-                                &db, friend_oid, user_oid,
-                            )
-                            .await;
+                            crate::utils::tips::try_sync_dm_tip_unread(&db, friend_oid, user_oid)
+                                .await;
                         match (synced_viewer, synced_peer) {
                             (Some(nv), Some(np)) => {
                                 crate::utils::unread::emit_unread_absolute(
-                                    &user_id, "dm", friend_user_id, nv,
+                                    &user_id,
+                                    "dm",
+                                    friend_user_id,
+                                    nv,
                                 );
                                 crate::utils::unread::emit_unread_absolute(
-                                    friend_user_id, "dm", &user_id, np,
+                                    friend_user_id,
+                                    "dm",
+                                    &user_id,
+                                    np,
                                 );
                             }
                             _ => {
                                 crate::utils::unread::invalidate_unread_generation(
-                                    &user_id, "dm", friend_user_id,
+                                    &user_id,
+                                    "dm",
+                                    friend_user_id,
                                 );
                                 crate::utils::unread::invalidate_unread_generation(
-                                    friend_user_id, "dm", &user_id,
+                                    friend_user_id,
+                                    "dm",
+                                    &user_id,
                                 );
                             }
                         }
                     }
                     Err(_) => {
                         crate::utils::unread::invalidate_unread_generation(
-                            &user_id, "dm", friend_user_id,
+                            &user_id,
+                            "dm",
+                            friend_user_id,
                         );
                         crate::utils::unread::invalidate_unread_generation(
-                            friend_user_id, "dm", &user_id,
+                            friend_user_id,
+                            "dm",
+                            &user_id,
                         );
                     }
                 }
             }
             Err(_) => {
-
-                crate::utils::unread::invalidate_unread_generation(
-                    &user_id, "dm", friend_user_id,
-                );
-                crate::utils::unread::invalidate_unread_generation(
-                    friend_user_id, "dm", &user_id,
-                );
+                crate::utils::unread::invalidate_unread_generation(&user_id, "dm", friend_user_id);
+                crate::utils::unread::invalidate_unread_generation(friend_user_id, "dm", &user_id);
             }
         }
     }
 
-    HttpResponse::Ok().json(json!({ "message": "Kontakt został usunięty." }))
+    HttpResponse::Ok().json(json!({
+        "message": "Kontakt został usunięty.",
+        "wipePending": wipe_pending,
+        "cleanupPending": cleanup_pending,
+    }))
 }

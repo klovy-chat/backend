@@ -50,7 +50,6 @@ pub async fn try_dm_block_flags(
         .map_err(|_| ())?;
     let docs: Vec<Document> = cursor.try_collect().await.map_err(|_| ())?;
     if docs.len() < 2 {
-
         crate::utils::friends::cache::put_cached_block_flags(viewer, peer, false, false);
         return Ok((false, false));
     }
@@ -59,11 +58,8 @@ pub async fn try_dm_block_flags(
         doc.get_array("blockedContacts")
             .ok()
             .map(|arr| {
-                arr.iter().any(|b| {
-                    b.as_object_id()
-                        .map(|id| id == other)
-                        .unwrap_or(false)
-                })
+                arr.iter()
+                    .any(|b| b.as_object_id().map(|id| id == other).unwrap_or(false))
             })
             .unwrap_or(false)
     };
@@ -71,27 +67,20 @@ pub async fn try_dm_block_flags(
     let mut viewer_blocks = false;
     let mut peer_blocks = false;
     for doc in &docs {
-        let Ok(id) = doc.get_object_id("_id") else { continue };
+        let Ok(id) = doc.get_object_id("_id") else {
+            continue;
+        };
         if id == u1 {
             viewer_blocks = blocks(doc, u2);
         } else if id == u2 {
             peer_blocks = blocks(doc, u1);
         }
     }
-    crate::utils::friends::cache::put_cached_block_flags(
-        viewer,
-        peer,
-        viewer_blocks,
-        peer_blocks,
-    );
+    crate::utils::friends::cache::put_cached_block_flags(viewer, peer, viewer_blocks, peer_blocks);
     Ok((viewer_blocks, peer_blocks))
 }
 
-pub async fn try_is_dm_blocked(
-    db: &Database,
-    user_id1: &str,
-    user_id2: &str,
-) -> Result<bool, ()> {
+pub async fn try_is_dm_blocked(db: &Database, user_id1: &str, user_id2: &str) -> Result<bool, ()> {
     if let Some(blocked) = get_cached_block_pair(user_id1, user_id2) {
         return Ok(blocked);
     }
@@ -200,7 +189,6 @@ pub async fn emit_to_friends(db: &Database, user_id: &str, event: &str, data: Va
                 }
             }
             Err(_) => {
-
                 log::warn!("emit_to_friends: friend list unavailable for {user_id}");
             }
         },

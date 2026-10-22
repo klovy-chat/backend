@@ -29,10 +29,7 @@ pub fn serialize_user(user: &User) -> Value {
     serialize_user_for_viewer(user, true)
 }
 
-pub fn serialize_user_for_viewer(
-    user: &User,
-    is_self: bool,
-) -> Value {
+pub fn serialize_user_for_viewer(user: &User, is_self: bool) -> Value {
     let bio = user
         .bio
         .as_ref()

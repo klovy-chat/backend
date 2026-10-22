@@ -54,7 +54,9 @@ impl ChannelModerationEntry {
     }
 }
 
-pub fn active_moderation_entries(entries: &[ChannelModerationEntry]) -> Vec<ChannelModerationEntry> {
+pub fn active_moderation_entries(
+    entries: &[ChannelModerationEntry],
+) -> Vec<ChannelModerationEntry> {
     entries
         .iter()
         .filter(|entry| entry.is_active())

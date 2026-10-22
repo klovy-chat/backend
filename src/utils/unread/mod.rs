@@ -16,8 +16,8 @@ use mongodb::Database;
 use once_cell::sync::Lazy;
 use serde::Serialize;
 
-use crate::model::read_state::ChannelReadState;
 use crate::model::messages::Message;
+use crate::model::read_state::ChannelReadState;
 use crate::ws::registry;
 
 static UNREAD_REVISION: AtomicU64 = AtomicU64::new(1);
@@ -62,7 +62,6 @@ fn bump_user_watermark(user_id: &str, value: u64) {
     let entry = wm.entry(user_id.to_string()).or_insert(0);
     *entry = (*entry).max(value);
     if wm.len() > USER_WATERMARK_MAX {
-
         let overflow = wm.len() - USER_WATERMARK_MAX;
         let mut entries: Vec<(String, u64)> = wm.iter().map(|(k, v)| (k.clone(), *v)).collect();
         entries.sort_by_key(|(_, v)| *v);
@@ -105,7 +104,6 @@ fn maybe_gc_generations(guard: &mut HashMap<String, GenerationEntry>) {
             *entry = (*entry).max(value);
         }
         if floor.len() > GENERATION_FLOOR_MAX {
-
             let overflow = floor.len() - GENERATION_FLOOR_MAX;
             let mut entries: Vec<(String, u64)> =
                 floor.iter().map(|(k, v)| (k.clone(), *v)).collect();
@@ -205,7 +203,6 @@ pub async fn try_count_dm_unread(
     user_id: ObjectId,
     contact_id: ObjectId,
 ) -> Option<u64> {
-
     let filter = doc! {
         "sender": contact_id,
         "recipient": user_id,
@@ -221,7 +218,10 @@ pub async fn try_count_dm_unread(
             },
         ],
     };
-    match Message::collection(db).count_documents(filter.clone()).await {
+    match Message::collection(db)
+        .count_documents(filter.clone())
+        .await
+    {
         Ok(n) => Some(n),
         Err(_) => Message::collection(db).count_documents(filter).await.ok(),
     }
@@ -232,7 +232,6 @@ pub async fn try_count_channel_unread(
     user_id: ObjectId,
     channel_id: ObjectId,
 ) -> Option<u64> {
-
     for _ in 0..3 {
         let state = match ChannelReadState::find(db, user_id, channel_id).await {
             Ok(s) => s,
@@ -250,7 +249,10 @@ pub async fn try_count_channel_unread(
             "sender": { "$ne": user_id },
             "deleted": { "$ne": true },
         };
-        let n = match Message::collection(db).count_documents(filter.clone()).await {
+        let n = match Message::collection(db)
+            .count_documents(filter.clone())
+            .await
+        {
             Ok(n) => n,
             Err(_) => match Message::collection(db).count_documents(filter).await {
                 Ok(n) => n,
@@ -295,8 +297,7 @@ pub async fn set_channel_unread_denorm(
     use mongodb::options::UpdateOptions;
     let now = DateTime::now();
 
-    let last_read =
-        DateTime::from_millis(now.timestamp_millis().saturating_sub(1));
+    let last_read = DateTime::from_millis(now.timestamp_millis().saturating_sub(1));
 
     ChannelReadState::collection(db)
         .update_one(
@@ -364,13 +365,7 @@ pub fn emit_unread_delta(user_id: &str, kind: &str, id: &str, delta: i64) {
     emit_unread_delta_at(user_id, kind, id, delta, generation);
 }
 
-pub fn emit_unread_delta_at(
-    user_id: &str,
-    kind: &str,
-    id: &str,
-    delta: i64,
-    generation: u64,
-) {
+pub fn emit_unread_delta_at(user_id: &str, kind: &str, id: &str, delta: i64, generation: u64) {
     emit_unread_updated(
         user_id,
         UnreadUpdatedEvent {
@@ -407,12 +402,11 @@ pub fn emit_unread_absolute(user_id: &str, kind: &str, id: &str, unread_count: u
     );
 }
 
-pub async fn emit_dm_unread_updated(
-    db: &Database,
-    user_id: &str,
-    contact_id: &str,
-) -> Option<u64> {
-    let (Ok(uid), Ok(cid)) = (ObjectId::parse_str(user_id), ObjectId::parse_str(contact_id)) else {
+pub async fn emit_dm_unread_updated(db: &Database, user_id: &str, contact_id: &str) -> Option<u64> {
+    let (Ok(uid), Ok(cid)) = (
+        ObjectId::parse_str(user_id),
+        ObjectId::parse_str(contact_id),
+    ) else {
         return None;
     };
     let Some(unread) = try_count_dm_unread(db, uid, cid).await else {
@@ -427,7 +421,10 @@ pub async fn emit_channel_unread_updated(
     user_id: &str,
     channel_id: &str,
 ) -> Option<u64> {
-    let (Ok(uid), Ok(cid)) = (ObjectId::parse_str(user_id), ObjectId::parse_str(channel_id)) else {
+    let (Ok(uid), Ok(cid)) = (
+        ObjectId::parse_str(user_id),
+        ObjectId::parse_str(channel_id),
+    ) else {
         return None;
     };
     let Some(unread) = try_count_channel_unread(db, uid, cid).await else {
@@ -442,7 +439,10 @@ pub async fn mark_channel_as_read_for_user(
     user_id: &str,
     channel_id: &str,
 ) -> Result<(), ()> {
-    let (Ok(uid), Ok(cid)) = (ObjectId::parse_str(user_id), ObjectId::parse_str(channel_id)) else {
+    let (Ok(uid), Ok(cid)) = (
+        ObjectId::parse_str(user_id),
+        ObjectId::parse_str(channel_id),
+    ) else {
         return Err(());
     };
     ChannelReadState::upsert(db, uid, cid).await.map_err(|_| ())

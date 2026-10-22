@@ -23,14 +23,15 @@ use crate::model::scan_cache::ScanVerdict;
 use crate::model::uploads::PendingUpload;
 use crate::utils::db::get_db;
 use crate::utils::hash::sha256_hex;
-use crate::utils::messages::serialize_message;
 use crate::utils::messages::access::canonicalize_message_file_url;
+use crate::utils::messages::serialize_message;
 use crate::utils::storage::{cdn_public_base_url, is_attachment_key, storage};
 use crate::ws::registry;
 
 use super::clamd::{clamd_addr, scan_bytes, ClamVerdict};
 
 const MAX_SCAN_ATTEMPTS: u8 = 8;
+const SCAN_RECOVERY_RETRY_DELAY: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone)]
 pub struct ScanJob {
@@ -106,9 +107,14 @@ fn schedule_retry(mut job: ScanJob) {
     }
     if job.attempts >= MAX_SCAN_ATTEMPTS {
         log::error!(
-            "attachment scan gave up after {MAX_SCAN_ATTEMPTS} attempts: {}",
+            "attachment scan exhausted {MAX_SCAN_ATTEMPTS} short retries; retrying after recovery delay: {}",
             job.file_path
         );
+        job.attempts = 0;
+        tokio::spawn(async move {
+            tokio::time::sleep(SCAN_RECOVERY_RETRY_DELAY).await;
+            enqueue(job);
+        });
         return;
     }
     job.attempts = job.attempts.saturating_add(1);
@@ -174,13 +180,14 @@ pub async fn requeue_pending() {
 }
 
 async fn load_scan_bytes(path: &str) -> Result<Option<Vec<u8>>, String> {
-    if let Some(bytes) = storage().get_quarantine(path).await.map_err(|e| e.to_string())? {
+    if let Some(bytes) = storage()
+        .get_quarantine(path)
+        .await
+        .map_err(|e| e.to_string())?
+    {
         return Ok(Some(bytes));
     }
-    storage()
-        .get_public(path)
-        .await
-        .map_err(|e| e.to_string())
+    storage().get_public(path).await.map_err(|e| e.to_string())
 }
 
 async fn process_job(job: ScanJob) -> Result<(), String> {
@@ -218,7 +225,12 @@ async fn process_job(job: ScanJob) -> Result<(), String> {
             "attachment hash mismatch for {}, treating as blocked",
             job.file_path
         );
-        let _ = ScanVerdict::put(&db, &actual_hash, ScanStatus::Blocked, false).await;
+        if let Err(error) = ScanVerdict::put(&db, &actual_hash, ScanStatus::Blocked, false).await {
+            log::warn!(
+                "Failed to cache blocked attachment verdict for {}: {error}",
+                job.file_path
+            );
+        }
         return apply_verdict(
             &db,
             &job.file_path,
@@ -231,8 +243,17 @@ async fn process_job(job: ScanJob) -> Result<(), String> {
 
     let clamd_configured = clamd_addr().is_some();
 
-    if let Ok(Some(cached)) = ScanVerdict::get(&db, &actual_hash).await {
-        return apply_verdict(&db, &job.file_path, &content_type, cached, &bytes).await;
+    match ScanVerdict::get(&db, &actual_hash).await {
+        Ok(Some(cached)) => {
+            return apply_verdict(&db, &job.file_path, &content_type, cached, &bytes).await;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            log::warn!(
+                "Failed to read cached attachment scan verdict for {}: {error}",
+                job.file_path
+            );
+        }
     }
 
     if !clamd_configured {
@@ -250,7 +271,12 @@ async fn process_job(job: ScanJob) -> Result<(), String> {
     };
 
     if !actual_hash.is_empty() {
-        let _ = ScanVerdict::put(&db, &actual_hash, verdict, true).await;
+        if let Err(error) = ScanVerdict::put(&db, &actual_hash, verdict, true).await {
+            log::warn!(
+                "Failed to cache attachment scan verdict for {}: {error}",
+                job.file_path
+            );
+        }
     }
     apply_verdict(&db, &job.file_path, &content_type, verdict, &bytes).await
 }
@@ -269,7 +295,9 @@ async fn apply_verdict(
                 .publish_scanned(file_path, bytes.to_vec(), content_type)
                 .await
                 .map_err(|e| e.to_string())?;
-            let _ = PendingUpload::set_scan_status(db, file_path, ScanStatus::Clean).await;
+            PendingUpload::set_scan_status(db, file_path, ScanStatus::Clean)
+                .await
+                .map_err(|e| format!("update pending upload scan status for {file_path}: {e}"))?;
             let messages = Message::apply_scan_verdict(db, file_path, ScanStatus::Clean, false)
                 .await
                 .map_err(|e| e.to_string())?;
@@ -277,12 +305,17 @@ async fn apply_verdict(
         }
         ScanStatus::Blocked => {
             log::warn!("attachment scan blocked {file_path}");
-            let _ = storage().delete_attachment_key(file_path).await;
-            let _ = PendingUpload::set_scan_status(db, file_path, ScanStatus::Blocked).await;
+            PendingUpload::set_scan_status(db, file_path, ScanStatus::Blocked)
+                .await
+                .map_err(|e| format!("update blocked upload scan status for {file_path}: {e}"))?;
             let messages = Message::apply_scan_verdict(db, file_path, ScanStatus::Blocked, true)
                 .await
                 .map_err(|e| e.to_string())?;
             emit_scan_updates(db, &messages).await;
+            storage()
+                .delete_attachment_key(file_path)
+                .await
+                .map_err(|e| format!("delete blocked attachment {file_path}: {e}"))?;
         }
         ScanStatus::Pending => {}
     }

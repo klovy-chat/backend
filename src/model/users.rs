@@ -6,11 +6,11 @@
 // Nigdy nie serializuj hash/sekretów w JSON publicznym (user/json.rs).
 // Przy zmianach: controllers/auth.rs, utils/user/json.rs.
 
+use mongodb::options::IndexOptions;
 use mongodb::{
     bson::{doc, oid::ObjectId, DateTime},
     Collection, Database, IndexModel,
 };
-use mongodb::options::IndexOptions;
 use serde::{Deserialize, Serialize};
 
 use crate::utils::crypto::passwords::{
@@ -98,10 +98,16 @@ pub struct User {
     #[serde(rename = "disabledAt", skip_serializing_if = "Option::is_none")]
     pub disabled_at: Option<DateTime>,
 
-    #[serde(rename = "deletionRequestedAt", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "deletionRequestedAt",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub deletion_requested_at: Option<DateTime>,
 
-    #[serde(rename = "deletionScheduledAt", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "deletionScheduledAt",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub deletion_scheduled_at: Option<DateTime>,
 
     #[serde(rename = "isOnline", default)]
@@ -128,13 +134,25 @@ pub struct User {
     #[serde(rename = "twoFactorEnabled", default)]
     pub two_factor_enabled: bool,
 
-    #[serde(rename = "totpSecret", skip_serializing_if = "Option::is_none", default)]
+    #[serde(
+        rename = "totpSecret",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     pub totp_secret: Option<String>,
 
-    #[serde(rename = "totpPendingSecret", skip_serializing_if = "Option::is_none", default)]
+    #[serde(
+        rename = "totpPendingSecret",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     pub totp_pending_secret: Option<String>,
 
-    #[serde(rename = "backupCodes", skip_serializing_if = "Option::is_none", default)]
+    #[serde(
+        rename = "backupCodes",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     pub backup_codes: Option<Vec<String>>,
 
     #[serde(rename = "createdAt")]
@@ -163,12 +181,14 @@ pub enum UserValidationError {
 impl std::fmt::Display for UserValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let msg = match self {
-            Self::UsernameRequired     => "Username is required",
-            Self::UsernameTooShort     => "Username must be at least 3 characters",
-            Self::UsernameTooLong      => "Username must be at most 32 characters",
-            Self::UsernameInvalidChars => "Username may only contain lowercase letters, numbers and underscores",
-            Self::PasswordRequired     => "Password is required",
-            Self::PasswordTooShort     => "Password must be at least 8 characters",
+            Self::UsernameRequired => "Username is required",
+            Self::UsernameTooShort => "Username must be at least 3 characters",
+            Self::UsernameTooLong => "Username must be at most 32 characters",
+            Self::UsernameInvalidChars => {
+                "Username may only contain lowercase letters, numbers and underscores"
+            }
+            Self::PasswordRequired => "Password is required",
+            Self::PasswordTooShort => "Password must be at least 8 characters",
         };
         write!(f, "{}", msg)
     }
@@ -223,11 +243,7 @@ impl User {
             )
             .await?;
         Self::collection(db)
-            .create_index(
-                IndexModel::builder()
-                    .keys(doc! { "createdAt": -1 })
-                    .build(),
-            )
+            .create_index(IndexModel::builder().keys(doc! { "createdAt": -1 }).build())
             .await?;
 
         Ok(())
@@ -293,20 +309,14 @@ impl User {
     }
 
     pub fn is_login_allowed(&self) -> bool {
-        self.is_active
-            && !self.is_disabled
-            && !self.is_blocked
-            && !self.is_banned
+        self.is_active && !self.is_disabled && !self.is_blocked && !self.is_banned
     }
 
     pub fn is_pending_deletion(&self) -> bool {
         self.deletion_scheduled_at.is_some()
     }
 
-    pub async fn find_by_id(
-        db: &Database,
-        id: ObjectId,
-    ) -> mongodb::error::Result<Option<User>> {
+    pub async fn find_by_id(db: &Database, id: ObjectId) -> mongodb::error::Result<Option<User>> {
         Self::collection(db).find_one(doc! { "_id": id }).await
     }
 
@@ -373,10 +383,7 @@ impl User {
         Self::find_by_id(db, id).await
     }
 
-    pub async fn username_exists(
-        db: &Database,
-        username: &str,
-    ) -> mongodb::error::Result<bool> {
+    pub async fn username_exists(db: &Database, username: &str) -> mongodb::error::Result<bool> {
         let count = Self::collection(db)
             .count_documents(doc! { "username": normalize_username(username) })
             .await?;
@@ -397,10 +404,7 @@ impl User {
         Ok(count > 0)
     }
 
-    pub async fn invalidate_tokens(
-        db: &Database,
-        id: ObjectId,
-    ) -> mongodb::error::Result<()> {
+    pub async fn invalidate_tokens(db: &Database, id: ObjectId) -> mongodb::error::Result<()> {
         Self::collection(db)
             .update_one(
                 doc! { "_id": id },

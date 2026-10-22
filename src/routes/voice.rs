@@ -10,9 +10,7 @@ use actix_web::web;
 use actix_web_lab::middleware::from_fn;
 
 use crate::controllers::voice::{get_active_call, get_voice_token};
-use crate::middlewares::auth::{
-    log_suspicious_activity, require_active_account, verify_token,
-};
+use crate::middlewares::auth::{log_suspicious_activity, require_active_account, verify_token};
 
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.service(

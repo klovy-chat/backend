@@ -22,7 +22,6 @@ use crate::ws::registry::{channel_recipient_ids, emit_to_user, emit_to_users};
 
 #[derive(Debug, Deserialize, Default)]
 struct CreateInviteBody {
-
     #[serde(rename = "maxUses", default)]
     max_uses: Option<u32>,
 }
@@ -72,15 +71,14 @@ fn frontend_origin(req: &HttpRequest) -> String {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string())
             .unwrap_or_else(|| {
-                std::env::var("FRONTEND_URL").unwrap_or_else(|_| "http://127.0.0.1:5173".to_string())
+                std::env::var("FRONTEND_URL")
+                    .unwrap_or_else(|_| "http://127.0.0.1:5173".to_string())
             })
     };
     origin.trim_end_matches('/').to_string()
 }
 
-async fn require_channel_owner(
-    req: &HttpRequest,
-) -> Result<(ObjectId, ObjectId), HttpResponse> {
+async fn require_channel_owner(req: &HttpRequest) -> Result<(ObjectId, ObjectId), HttpResponse> {
     let user_id = request_user_id(req).unwrap_or_default();
     let channel_id = req.match_info().get("channelId").unwrap_or("");
     let Ok(channel_oid) = ObjectId::parse_str(channel_id) else {
@@ -99,6 +97,12 @@ async fn require_channel_owner(
     if channel.admin.to_hex() != user_id {
         return Err(HttpResponse::Forbidden()
             .json(json!({ "error": "Only the channel owner can manage invites" })));
+    }
+    if channel.is_deleting {
+        return Err(HttpResponse::ServiceUnavailable().json(json!({
+            "error": "Channel deletion is in progress",
+            "retryable": true,
+        })));
     }
 
     let Ok(user_oid) = ObjectId::parse_str(&user_id) else {
@@ -132,7 +136,14 @@ pub async fn create_invite(req: HttpRequest, body: web::Bytes) -> HttpResponse {
     let parsed: CreateInviteBody = if body.is_empty() {
         CreateInviteBody::default()
     } else {
-        serde_json::from_slice(&body).unwrap_or_default()
+        match serde_json::from_slice(&body) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                return HttpResponse::BadRequest().json(json!({
+                    "error": format!("Invalid request body: {error}"),
+                }));
+            }
+        }
     };
 
     let max_uses = match parsed.max_uses {
@@ -209,6 +220,10 @@ pub async fn get_invite(req: HttpRequest) -> HttpResponse {
         Ok(c) => c,
         Err(e) => return db_error("get_invite: channel", e),
     };
+    let channel_deleting = channel
+        .as_ref()
+        .map(|channel| channel.is_deleting)
+        .unwrap_or(true);
     let channel_json = channel.map(|c| {
         let member_count = crate::utils::channel::channel_member_count(&c);
         json!({
@@ -240,7 +255,8 @@ pub async fn get_invite(req: HttpRequest) -> HttpResponse {
         .max_uses
         .map(|max| invite.use_count >= max)
         .unwrap_or(false);
-    let joinable = !invite.revoked && !invite.used && !expired && !limit_reached;
+    let joinable =
+        !channel_deleting && !invite.revoked && !invite.used && !expired && !limit_reached;
 
     HttpResponse::Ok().json(json!({
         "invite": {
@@ -271,6 +287,63 @@ pub async fn accept_invite(req: HttpRequest) -> HttpResponse {
         Err(e) => return db_error("accept_invite: invite lookup", e),
     };
 
+    let channel = match Channel::find_by_id(&db, invite.channel_id).await {
+        Ok(Some(c)) => c,
+        Ok(None) => return HttpResponse::NotFound().json(json!({ "error": "Kanał nie istnieje" })),
+        Err(e) => return db_error("accept_invite: channel lookup", e),
+    };
+
+    if channel.is_deleting {
+        return HttpResponse::ServiceUnavailable().json(json!({
+            "error": "Channel deletion is in progress",
+            "retryable": true,
+        }));
+    }
+
+    if is_channel_banned(&channel, Some(&user_id)) {
+        return HttpResponse::Forbidden()
+            .json(json!({ "error": "Nie masz dostępu do tego kanału" }));
+    }
+
+    let channel_id_hex = channel.id.map(|o| o.to_hex());
+
+    if is_channel_member(&channel, Some(&user_id)) {
+        let user_reservation_suffix = format!(":{user_id}");
+        let mut usage_finalization_pending = false;
+        for reservation_id in invite
+            .pending_use_ids
+            .iter()
+            .filter(|id| id.ends_with(&user_reservation_suffix))
+        {
+            let mut finalized = false;
+            for attempt in 0..2 {
+                match Invite::commit_use(&db, invite_id, reservation_id).await {
+                    Ok(()) => {
+                        finalized = true;
+                        break;
+                    }
+                    Err(error) if attempt == 0 => {
+                        log::warn!(
+                            "Retrying pending invite-use finalization for {invite_id}: {error}"
+                        );
+                    }
+                    Err(error) => {
+                        log::error!(
+                            "Failed to finalize pending invite use for {invite_id}: {error}"
+                        );
+                    }
+                }
+            }
+            usage_finalization_pending |= !finalized;
+        }
+        return HttpResponse::Ok().json(json!({
+            "success": true,
+            "channelId": channel_id_hex,
+            "alreadyMember": true,
+            "usageFinalizationPending": usage_finalization_pending,
+        }));
+    }
+
     if invite.revoked || invite.used {
         return HttpResponse::BadRequest()
             .json(json!({ "error": "Zaproszenie zostało wyłączone przez właściciela kanału" }));
@@ -289,42 +362,20 @@ pub async fn accept_invite(req: HttpRequest) -> HttpResponse {
         }
     }
 
-    let channel = match Channel::find_by_id(&db, invite.channel_id).await {
-        Ok(Some(c)) => c,
-        Ok(None) => return HttpResponse::NotFound().json(json!({ "error": "Kanał nie istnieje" })),
-        Err(e) => return db_error("accept_invite: channel lookup", e),
-    };
-
-    if is_channel_banned(&channel, Some(&user_id)) {
-        return HttpResponse::Forbidden()
-            .json(json!({ "error": "Nie masz dostępu do tego kanału" }));
-    }
-
-    let channel_id_hex = channel.id.map(|o| o.to_hex());
-
-    if is_channel_member(&channel, Some(&user_id)) {
-        return HttpResponse::Ok().json(json!({
-            "success": true,
-            "channelId": channel_id_hex,
-            "alreadyMember": true,
-        }));
-    }
-
-    let reservation_id = uuid::Uuid::new_v4().to_string();
-    let consumed = match Invite::try_register_use(&db, invite_id, &reservation_id).await {
-        Ok(Some(i)) => i,
-        Ok(None) => {
-            return HttpResponse::BadRequest().json(
+    let reservation_id = format!("{}:{user_id}", uuid::Uuid::new_v4());
+    let consumed =
+        match Invite::try_register_use(&db, invite_id, &reservation_id).await {
+            Ok(Some(i)) => i,
+            Ok(None) => return HttpResponse::BadRequest().json(
                 json!({ "error": "Zaproszenie zostało wyłączone, wygasło lub osiągnęło limit" }),
-            )
-        }
-        Err(e) => {
-            if let Err(response) = refund_invite_use(&db, invite_id, &reservation_id).await {
-                return response;
+            ),
+            Err(e) => {
+                if let Err(response) = refund_invite_use(&db, invite_id, &reservation_id).await {
+                    return response;
+                }
+                return db_error("accept_invite: register use", e);
             }
-            return db_error("accept_invite: register use", e);
-        }
-    };
+        };
 
     let channel = match Channel::find_by_id(&db, consumed.channel_id).await {
         Ok(Some(c)) => c,
@@ -341,6 +392,16 @@ pub async fn accept_invite(req: HttpRequest) -> HttpResponse {
             return db_error_retryable("accept_invite: channel reload", e);
         }
     };
+
+    if channel.is_deleting {
+        if let Err(response) = refund_invite_use(&db, invite_id, &reservation_id).await {
+            return response;
+        }
+        return HttpResponse::ServiceUnavailable().json(json!({
+            "error": "Channel deletion is in progress",
+            "retryable": true,
+        }));
+    }
 
     if is_channel_banned(&channel, Some(&user_id)) {
         if let Err(response) = refund_invite_use(&db, invite_id, &reservation_id).await {
@@ -387,12 +448,9 @@ pub async fn accept_invite(req: HttpRequest) -> HttpResponse {
         }));
     };
 
-    if let Err(error) = crate::model::read_state::ChannelReadState::seed_if_missing(
-        &db,
-        user_oid,
-        channel_oid,
-    )
-    .await
+    if let Err(error) =
+        crate::model::read_state::ChannelReadState::reset_for_rejoin(&db, user_oid, channel_oid)
+            .await
     {
         log::error!("Failed to seed channel read state during invite acceptance: {error}");
         if let Err(response) = refund_invite_use(&db, invite_id, &reservation_id).await {
@@ -406,12 +464,12 @@ pub async fn accept_invite(req: HttpRequest) -> HttpResponse {
 
     let res = Channel::collection(&db)
         .update_one(
-            doc! { "_id": channel_oid },
+            doc! { "_id": channel_oid, "isDeleting": { "$ne": true } },
             doc! { "$addToSet": { "members": user_oid }, "$set": { "updatedAt": DateTime::now() } },
         )
         .await;
-    let modified = match res {
-        Ok(r) => r.modified_count,
+    let (matched, modified) = match res {
+        Ok(r) => (r.matched_count, r.modified_count),
         Err(error) => {
             log::error!("Failed to add invitee to channel: {error}");
             if let Err(response) = refund_invite_use(&db, invite_id, &reservation_id).await {
@@ -422,6 +480,15 @@ pub async fn accept_invite(req: HttpRequest) -> HttpResponse {
         }
     };
 
+    if matched == 0 {
+        if let Err(response) = refund_invite_use(&db, invite_id, &reservation_id).await {
+            return response;
+        }
+        return HttpResponse::ServiceUnavailable().json(json!({
+            "error": "Channel deletion is in progress",
+            "retryable": true,
+        }));
+    }
     if modified == 0 {
         if let Err(response) = refund_invite_use(&db, invite_id, &reservation_id).await {
             return response;
@@ -433,20 +500,54 @@ pub async fn accept_invite(req: HttpRequest) -> HttpResponse {
         }));
     }
 
-    if let Err(error) = Invite::commit_use(&db, invite_id, &reservation_id).await {
-        log::error!("Failed to commit invite-use reservation for {invite_id}: {error}");
-        return HttpResponse::ServiceUnavailable().json(json!({
-            "error": "Membership was added, but invite usage finalization is pending",
-            "retryable": true,
-        }));
-    }
+    let usage_finalization_pending = match Invite::commit_use(&db, invite_id, &reservation_id).await
+    {
+        Ok(()) => false,
+        Err(error) => {
+            log::error!("Failed to commit invite-use reservation for {invite_id}: {error}");
+            if let Err(retry_error) = Invite::commit_use(&db, invite_id, &reservation_id).await {
+                log::error!(
+                    "Retry failed to commit invite-use reservation for {invite_id}: {retry_error}"
+                );
+                true
+            } else {
+                false
+            }
+        }
+    };
 
     let channel = match Channel::find_by_id(&db, channel_oid).await {
         Ok(Some(ch)) => ch,
-        Ok(None) | Err(_) => {
-            return HttpResponse::ServiceUnavailable().json(json!({
-                "error": "Temporarily unavailable",
-                "retryable": true,
+        Ok(None) => {
+            log::error!(
+                "Channel {} disappeared after invite membership was committed",
+                channel_oid
+            );
+            emit_to_user(
+                &user_id,
+                "channel-added",
+                json!({ "channelId": channel_oid.to_hex() }),
+            );
+            return HttpResponse::Ok().json(json!({
+                "success": true,
+                "channelId": channel_id_hex,
+                "usageFinalizationPending": usage_finalization_pending,
+            }));
+        }
+        Err(error) => {
+            log::error!(
+                "Failed to reload channel {} after invite membership was committed: {error}",
+                channel_oid
+            );
+            emit_to_user(
+                &user_id,
+                "channel-added",
+                json!({ "channelId": channel_oid.to_hex() }),
+            );
+            return HttpResponse::Ok().json(json!({
+                "success": true,
+                "channelId": channel_id_hex,
+                "usageFinalizationPending": usage_finalization_pending,
             }));
         }
     };
@@ -478,5 +579,9 @@ pub async fn accept_invite(req: HttpRequest) -> HttpResponse {
         }),
     );
     crate::ws::typing::invalidate_channel(&channel_oid.to_hex());
-    HttpResponse::Ok().json(json!({ "success": true, "channelId": channel_id_hex }))
+    HttpResponse::Ok().json(json!({
+        "success": true,
+        "channelId": channel_id_hex,
+        "usageFinalizationPending": usage_finalization_pending,
+    }))
 }

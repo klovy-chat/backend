@@ -6,7 +6,9 @@
 // Zmiana parametrów = wszyscy re-login przy verify fail — migruj ostrożnie.
 // Przy zmianach: controllers/auth.rs.
 
-use argon2::password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::password_hash::{
+    rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
+};
 use argon2::{Algorithm, Argon2, Params, Version};
 use lazy_static::lazy_static;
 use regex::Regex;
@@ -29,7 +31,10 @@ pub fn is_stored_password_hash(value: &str) -> bool {
     ARGON2_HASH_PREFIX.is_match(value)
 }
 
-fn hash_with(hasher: Argon2<'static>, plain: String) -> Result<String, argon2::password_hash::Error> {
+fn hash_with(
+    hasher: Argon2<'static>,
+    plain: String,
+) -> Result<String, argon2::password_hash::Error> {
     let salt = SaltString::generate(&mut OsRng);
     let hash = hasher.hash_password(plain.as_bytes(), &salt)?;
     Ok(hash.to_string())

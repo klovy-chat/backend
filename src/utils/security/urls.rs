@@ -47,7 +47,9 @@ fn ip_is_blocked(ip: std::net::IpAddr) -> bool {
                 || (v4.octets()[0] == 169 && v4.octets()[1] == 254)
                 || v4.octets()[0] == 0
         }
-        std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() || v6.is_unique_local(),
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() || v6.is_unique_local()
+        }
     }
 }
 

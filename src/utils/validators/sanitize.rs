@@ -21,8 +21,7 @@ use super::unicode::{
 };
 
 lazy_static! {
-    static ref SCRIPT_TAG: Regex =
-        Regex::new(r"(?is)<script\b[^>]*>.*?</script>").unwrap();
+    static ref SCRIPT_TAG: Regex = Regex::new(r"(?is)<script\b[^>]*>.*?</script>").unwrap();
     static ref JS_PROTO: Regex = Regex::new(r"(?i)javascript:").unwrap();
     static ref ON_EVENT: Regex = Regex::new(r"(?i)on\w+\s*=").unwrap();
 }
@@ -44,6 +43,13 @@ pub fn strip_dangerous(input: &str) -> String {
     s.into_owned()
 }
 
+fn is_password_field(field: &str) -> bool {
+    matches!(
+        field.to_ascii_lowercase().as_str(),
+        "password" | "currentpassword" | "newpassword" | "confirmpassword"
+    )
+}
+
 fn sanitize_json_value(value: &mut Value) {
     match value {
         Value::String(s) => {
@@ -56,8 +62,10 @@ fn sanitize_json_value(value: &mut Value) {
             }
         }
         Value::Object(map) => {
-            for (_, v) in map.iter_mut() {
-                sanitize_json_value(v);
+            for (field, value) in map.iter_mut() {
+                if !is_password_field(field) {
+                    sanitize_json_value(value);
+                }
             }
         }
         _ => {}
@@ -109,4 +117,30 @@ pub async fn sanitize_input_middleware(
     let req = ServiceRequest::from_parts(http_req, payload);
 
     Ok(next.call(req).await?.map_into_boxed_body())
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::sanitize_json_value;
+
+    #[test]
+    fn sanitize_preserves_password_values_and_cleans_other_text() {
+        let mut body = json!({
+            "password": "  exact <script>secret</script>  ",
+            "currentPassword": " current ",
+            "newPassword": " new ",
+            "confirmPassword": " confirm ",
+            "username": "  <script>user</script>  "
+        });
+
+        sanitize_json_value(&mut body);
+
+        assert_eq!(body["password"], "  exact <script>secret</script>  ");
+        assert_eq!(body["currentPassword"], " current ");
+        assert_eq!(body["newPassword"], " new ");
+        assert_eq!(body["confirmPassword"], " confirm ");
+        assert_eq!(body["username"], "");
+    }
 }

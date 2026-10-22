@@ -7,17 +7,16 @@
 // Przy zmianach: loaders/server.rs, utils/config.rs, utils/db/mod.rs.
 
 use klovy_chat_server::loaders::server;
-use klovy_chat_server::utils::env::is_production;
 use klovy_chat_server::model::{
     announcements::Announcement, audit::AuditLog, channels::Channel,
-    read_state::ChannelReadState, reports::ChannelReport,
-    friend_requests::FriendRequest, invites::Invite,
-    messages::Message, uploads::PendingUpload, scan_cache::ScanVerdict,
-    refresh_tokens::RefreshToken, users::User, storage_usage::UserStorageUsage,
-    storage_cleanup::PendingStorageDeletion, warnings::Warning,
+    friend_requests::FriendRequest, invites::Invite, messages::Message,
+    read_state::ChannelReadState, refresh_tokens::RefreshToken, reports::ChannelReport,
+    scan_cache::ScanVerdict, storage_cleanup::PendingStorageDeletion,
+    storage_usage::UserStorageUsage, uploads::PendingUpload, users::User, warnings::Warning,
 };
-use klovy_chat_server::utils::db_url::database_url;
 use klovy_chat_server::utils::db;
+use klovy_chat_server::utils::db_url::database_url;
+use klovy_chat_server::utils::env::is_production;
 use klovy_chat_server::utils::storage::reconcile_attachments;
 
 #[actix_web::main]
@@ -72,6 +71,15 @@ async fn main() -> std::io::Result<()> {
             log::info!("Startup: completed {deleted} pending storage deletions");
         }
         Err(error) => log::warn!("Startup pending storage deletion processing failed: {error}"),
+        _ => {}
+    }
+    match klovy_chat_server::utils::channel::deletion::resume_pending_channel_deletions(&mongodb_db)
+        .await
+    {
+        Ok(deleted) if deleted > 0 => {
+            log::info!("Startup: resumed deletion of {deleted} channel(s)");
+        }
+        Err(error) => log::warn!("Startup channel deletion recovery failed: {error}"),
         _ => {}
     }
 
@@ -139,6 +147,23 @@ async fn main() -> std::io::Result<()> {
     });
 
     tokio::spawn(async {
+        let interval = std::time::Duration::from_secs(60);
+        loop {
+            tokio::time::sleep(interval).await;
+            let db = klovy_chat_server::utils::db::get_db();
+            match klovy_chat_server::utils::channel::deletion::resume_pending_channel_deletions(&db)
+                .await
+            {
+                Ok(deleted) if deleted > 0 => {
+                    log::info!("Automatically completed deletion of {deleted} channel(s)");
+                }
+                Err(error) => log::warn!("Automatic channel deletion recovery failed: {error}"),
+                _ => {}
+            }
+        }
+    });
+
+    tokio::spawn(async {
         let interval = std::time::Duration::from_secs(60 * 60);
         loop {
             tokio::time::sleep(interval).await;
@@ -167,12 +192,17 @@ async fn main() -> std::io::Result<()> {
             tokio::time::sleep(interval).await;
             let db = klovy_chat_server::utils::db::get_db();
             match reconcile_attachments(&db).await {
-                Ok(report) if report.orphan_objects_deleted > 0 || report.missing_objects > 0 => {
+                Ok(report)
+                    if report.orphan_objects_deleted > 0
+                        || report.missing_objects > 0
+                        || report.usage_users_skipped_concurrent > 0 =>
+                {
                     log::info!(
-                        "Attachment reconcile: deleted {} orphan R2 objects, {} missing in R2, {} usage records updated",
+                        "Attachment reconcile: deleted {} orphan R2 objects, {} missing in R2, {} usage records updated, {} skipped due to concurrent changes",
                         report.orphan_objects_deleted,
                         report.missing_objects,
-                        report.usage_users_updated
+                        report.usage_users_updated,
+                        report.usage_users_skipped_concurrent
                     );
                 }
                 Ok(report) if report.usage_users_updated > 0 => {
@@ -189,10 +219,11 @@ async fn main() -> std::io::Result<()> {
 
     match reconcile_attachments(&mongodb_db).await {
         Ok(report) => log::info!(
-            "Startup attachment reconcile: deleted {} orphan R2 objects, {} missing in R2, {} usage records updated",
+            "Startup attachment reconcile: deleted {} orphan R2 objects, {} missing in R2, {} usage records updated, {} skipped due to concurrent changes",
             report.orphan_objects_deleted,
             report.missing_objects,
-            report.usage_users_updated
+            report.usage_users_updated,
+            report.usage_users_skipped_concurrent
         ),
         Err(e) => log::warn!("Startup attachment reconcile failed: {e}"),
     }
@@ -204,19 +235,37 @@ async fn main() -> std::io::Result<()> {
 async fn ensure_indexes(db: &mongodb::Database) {
     let tasks: [(&str, mongodb::error::Result<()>); 17] = [
         ("users", User::create_indexes(db).await),
-        ("signup_quotas", klovy_chat_server::utils::registration::create_indexes(db).await),
+        (
+            "signup_quotas",
+            klovy_chat_server::utils::registration::create_indexes(db).await,
+        ),
         ("channels", Channel::create_indexes(db).await),
         ("messages", Message::create_indexes(db).await),
         ("friend_requests", FriendRequest::create_indexes(db).await),
         ("invites", Invite::create_indexes(db).await),
-        ("channel_read_states", ChannelReadState::create_indexes(db).await),
-        ("dm_conversation_tips", klovy_chat_server::utils::tips::DmConversationTip::create_indexes(db).await),
+        (
+            "channel_read_states",
+            ChannelReadState::create_indexes(db).await,
+        ),
+        (
+            "dm_conversation_tips",
+            klovy_chat_server::utils::tips::DmConversationTip::create_indexes(db).await,
+        ),
         ("channel_reports", ChannelReport::create_indexes(db).await),
         ("refresh_tokens", RefreshToken::create_indexes(db).await),
         ("pending_uploads", PendingUpload::create_indexes(db).await),
-        ("attachment_scan_cache", ScanVerdict::create_indexes(db).await),
-        ("user_storage_usage", UserStorageUsage::create_indexes(db).await),
-        ("pending_storage_deletions", PendingStorageDeletion::create_indexes(db).await),
+        (
+            "attachment_scan_cache",
+            ScanVerdict::create_indexes(db).await,
+        ),
+        (
+            "user_storage_usage",
+            UserStorageUsage::create_indexes(db).await,
+        ),
+        (
+            "pending_storage_deletions",
+            PendingStorageDeletion::create_indexes(db).await,
+        ),
         ("audit_logs", AuditLog::create_indexes(db).await),
         ("warnings", Warning::create_indexes(db).await),
         ("announcements", Announcement::create_indexes(db).await),

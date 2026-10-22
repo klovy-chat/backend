@@ -6,15 +6,15 @@
 // Limit musi być ≥ max uploadu, inaczej 413 przed kontrolerem.
 // Przy zmianach: utils/upload.rs, loaders/server.rs.
 
-pub mod auth_fallback;
 pub mod auth;
+pub mod auth_fallback;
+pub mod captcha;
 pub mod client;
 pub mod csrf;
-pub mod proxy;
 pub mod ip_block;
 pub mod origin;
+pub mod proxy;
 pub mod signup;
-pub mod captcha;
 pub mod validation;
 
 use actix_web::dev::Payload;

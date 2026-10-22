@@ -6,8 +6,8 @@
 // Odpalaj po deploymencie kodu, który serwuje już sealed content.
 // Przy zmianach: utils/messages/encrypt_old.rs, model/messages.rs.
 
-use klovy_chat_server::utils::db_url::database_url;
 use klovy_chat_server::utils::db;
+use klovy_chat_server::utils::db_url::database_url;
 use klovy_chat_server::utils::messages::encrypt_old::{
     migrate_message_content_seal, MigrateContentSealOptions,
 };
@@ -61,12 +61,10 @@ async fn main() {
         std::process::exit(1);
     });
 
-    db::init_db(&database_url)
-        .await
-        .unwrap_or_else(|e| {
-            eprintln!("Failed to connect to MongoDB: {e}");
-            std::process::exit(1);
-        });
+    db::init_db(&database_url).await.unwrap_or_else(|e| {
+        eprintln!("Failed to connect to MongoDB: {e}");
+        std::process::exit(1);
+    });
 
     if dry_run {
         log::info!("DRY RUN — no writes. Pass --apply to update MongoDB.");
@@ -91,7 +89,10 @@ async fn main() {
     log::info!("Migration finished:");
     log::info!("  scanned: {}", report.scanned);
     log::info!("  migrated: {}", report.migrated);
-    log::info!("  skipped (already sealed): {}", report.skipped_already_sealed);
+    log::info!(
+        "  skipped (already sealed): {}",
+        report.skipped_already_sealed
+    );
     log::info!("  skipped (not needed): {}", report.skipped_not_needed);
     log::info!("  skipped (empty): {}", report.skipped_empty);
     log::info!("  skipped (unchanged): {}", report.skipped_unchanged);

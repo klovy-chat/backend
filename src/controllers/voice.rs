@@ -92,13 +92,22 @@ pub async fn get_voice_token(req: HttpRequest, body: web::Json<VoiceTokenBody>) 
         }));
     }
 
-    let peer_id = body.peer_id.as_deref().map(str::trim).filter(|s| !s.is_empty());
-    let channel_id = body.channel_id.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let peer_id = body
+        .peer_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let channel_id = body
+        .channel_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
 
     let room = match (peer_id, channel_id) {
         (Some(peer_id), None) => {
             if peer_id == user_id {
-                return HttpResponse::BadRequest().json(json!({ "message": "Cannot call yourself." }));
+                return HttpResponse::BadRequest()
+                    .json(json!({ "message": "Cannot call yourself." }));
             }
 
             let session = match token_allowed(&user_id, peer_id) {
@@ -131,13 +140,15 @@ pub async fn get_voice_token(req: HttpRequest, body: web::Json<VoiceTokenBody>) 
         }
         (None, Some(channel_id)) => {
             let Ok(channel_oid) = ObjectId::parse_str(channel_id) else {
-                return HttpResponse::BadRequest().json(json!({ "message": "Invalid channel ID." }));
+                return HttpResponse::BadRequest()
+                    .json(json!({ "message": "Invalid channel ID." }));
             };
             let db = get_db();
             let channel = match Channel::find_by_id(&db, channel_oid).await {
                 Ok(Some(channel)) => channel,
                 Ok(None) => {
-                    return HttpResponse::NotFound().json(json!({ "message": "Channel not found." }));
+                    return HttpResponse::NotFound()
+                        .json(json!({ "message": "Channel not found." }));
                 }
                 Err(_) => {
                     return HttpResponse::InternalServerError()
