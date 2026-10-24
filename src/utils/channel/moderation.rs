@@ -118,6 +118,7 @@ pub async fn upsert_muted_member(
 pub async fn populate_moderation_user_list(
     db: &Database,
     entries: &[ChannelModerationEntry],
+    viewer_id: &str,
 ) -> Vec<Value> {
     use super::fetch_users_map;
 
@@ -126,7 +127,7 @@ pub async fn populate_moderation_user_list(
         return Vec::new();
     }
     let ids: Vec<ObjectId> = active.iter().map(|e| e.user_id).collect();
-    let map = fetch_users_map(db, &ids).await;
+    let map = fetch_users_map(db, &ids, viewer_id).await;
     let mut out = Vec::with_capacity(active.len());
     for entry in active {
         let mut user = map
@@ -158,14 +159,15 @@ pub async fn populate_moderation_user_list(
 pub async fn get_channel_ban_mute_lists(
     db: &Database,
     channel_id: ObjectId,
+    viewer_id: &str,
 ) -> Option<(Vec<Value>, Vec<Value>)> {
     let channel = match Channel::find_by_id(db, channel_id).await {
         Ok(Some(c)) => c,
         Ok(None) => return Some((vec![], vec![])),
         Err(_) => return None,
     };
-    let banned = populate_moderation_user_list(db, &channel.banned_members).await;
-    let muted = populate_moderation_user_list(db, &channel.muted_members).await;
+    let banned = populate_moderation_user_list(db, &channel.banned_members, viewer_id).await;
+    let muted = populate_moderation_user_list(db, &channel.muted_members, viewer_id).await;
     Some((banned, muted))
 }
 

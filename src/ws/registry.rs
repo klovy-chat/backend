@@ -214,6 +214,10 @@ impl ConnectionRegistry {
         self.send_prebuilt_to_users(&user_ids, Arc::new(msg), is_critical_event(msg_type))
             .await;
     }
+
+    pub async fn connected_user_ids(&self) -> Vec<String> {
+        self.connections.lock().await.keys().cloned().collect()
+    }
 }
 
 pub fn revoke_session_remotely(user_id: &str, family_id: &str) {
@@ -295,6 +299,13 @@ pub fn emit_to_all_connected(event: &str, data: impl Serialize + Send + Sync + '
     tokio::spawn(async move {
         reg.broadcast_to_all(&event, payload).await;
     });
+}
+
+pub async fn connected_user_ids() -> Vec<String> {
+    match registry() {
+        Some(registry) => registry.connected_user_ids().await,
+        None => Vec::new(),
+    }
 }
 
 pub fn channel_recipient_ids(channel: &Channel) -> Vec<String> {

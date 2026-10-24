@@ -62,9 +62,10 @@ async fn serialize_channel_for_client(
     c: &Channel,
     viewer_id: ObjectId,
 ) -> Value {
+    let viewer_id_string = viewer_id.to_hex();
     let unread_fut = enrich_channel_unread(db, viewer_id, c);
-    let admin_fut = populate_channel_user(db, c.admin);
-    let members_fut = fetch_users_by_refs(db, &c.members);
+    let admin_fut = populate_channel_user(db, c.admin, &viewer_id_string);
+    let members_fut = fetch_users_by_refs(db, &c.members, &viewer_id_string);
     let mute_fut = User::find_by_id(db, viewer_id);
     let (unread_tip, admin, members, mute_user) =
         tokio::join!(unread_fut, admin_fut, members_fut, mute_fut);
@@ -509,9 +510,11 @@ pub async fn get_channel_details(req: HttpRequest) -> HttpResponse {
         }
     };
 
-    let admin = populate_channel_user(&db, channel.admin).await;
-    let members = fetch_users_by_refs(&db, &channel.members).await;
-    let Some((banned_members, muted_members)) = get_channel_ban_mute_lists(&db, cid).await else {
+    let admin = populate_channel_user(&db, channel.admin, &user_id).await;
+    let members = fetch_users_by_refs(&db, &channel.members, &user_id).await;
+    let Some((banned_members, muted_members)) =
+        get_channel_ban_mute_lists(&db, cid, &user_id).await
+    else {
         return HttpResponse::ServiceUnavailable().json(json!({
             "message": "Channels temporarily unavailable. Please retry.",
             "retryable": true,
@@ -1622,7 +1625,7 @@ pub async fn ban_channel_member(req: HttpRequest, body: web::Json<TargetUserBody
             "memberCount": remaining.len(),
         }),
     );
-    let lists = get_channel_ban_mute_lists(&db, cid).await;
+    let lists = get_channel_ban_mute_lists(&db, cid, &user_id).await;
     HttpResponse::Ok().json(json!({
         "message": "Użytkownik zbanowany na kanale",
         "bannedMembers": lists.as_ref().map(|(banned, _)| banned),
@@ -1683,7 +1686,7 @@ pub async fn unban_channel_member(
     typing::invalidate_channel(&cid.to_hex());
     crate::utils::access::cache::invalidate_channel(&cid.to_hex());
 
-    let lists = get_channel_ban_mute_lists(&db, cid).await;
+    let lists = get_channel_ban_mute_lists(&db, cid, &user_id).await;
     HttpResponse::Ok().json(json!({
         "message": "Ban użytkownika cofnięty",
         "bannedMembers": lists.as_ref().map(|(banned, _)| banned),
@@ -1774,7 +1777,7 @@ pub async fn mute_channel_member(
     typing::invalidate_channel(&cid.to_hex());
     crate::utils::access::cache::invalidate_channel(&cid.to_hex());
 
-    let lists = get_channel_ban_mute_lists(&db, cid).await;
+    let lists = get_channel_ban_mute_lists(&db, cid, &user_id).await;
     HttpResponse::Ok().json(json!({
         "message": "Użytkownik wyciszony na kanale",
         "bannedMembers": lists.as_ref().map(|(banned, _)| banned),
@@ -1842,7 +1845,7 @@ pub async fn unmute_channel_member(
     typing::invalidate_channel(&cid.to_hex());
     crate::utils::access::cache::invalidate_channel(&cid.to_hex());
 
-    let lists = get_channel_ban_mute_lists(&db, cid).await;
+    let lists = get_channel_ban_mute_lists(&db, cid, &user_id).await;
     HttpResponse::Ok().json(json!({
         "message": "Wyciszenie użytkownika cofnięte",
         "bannedMembers": lists.as_ref().map(|(banned, _)| banned),

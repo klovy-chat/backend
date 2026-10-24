@@ -18,6 +18,15 @@ use crate::utils::crypto::passwords::{
 };
 use crate::utils::validators::username::{is_valid_username, normalize_username};
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PresenceVisibility {
+    #[default]
+    Everyone,
+    Friends,
+    Nobody,
+}
+
 fn default_language() -> String {
     "en".to_string()
 }
@@ -115,6 +124,19 @@ pub struct User {
 
     #[serde(rename = "lastSeen", skip_serializing_if = "Option::is_none")]
     pub last_seen: Option<DateTime>,
+
+    #[serde(rename = "presenceVisibility", default)]
+    pub presence_visibility: PresenceVisibility,
+
+    #[serde(rename = "presenceVisibleTo", default)]
+    pub presence_visible_to: Vec<ObjectId>,
+
+    #[serde(
+        rename = "presenceHiddenUntil",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub presence_hidden_until: Option<DateTime>,
 
     #[serde(default = "default_language")]
     pub language: String,
@@ -285,6 +307,9 @@ impl User {
             deletion_scheduled_at: None,
             is_online: false,
             last_seen: None,
+            presence_visibility: PresenceVisibility::Everyone,
+            presence_visible_to: vec![],
+            presence_hidden_until: None,
             language: input
                 .language
                 .as_deref()

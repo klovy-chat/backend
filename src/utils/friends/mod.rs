@@ -10,6 +10,7 @@ use futures_util::TryStreamExt;
 use mongodb::bson::{doc, oid::ObjectId};
 use mongodb::Database;
 use serde_json::{json, Value};
+use std::collections::HashSet;
 
 use crate::model::friend_requests::FriendRequest;
 use crate::model::users::User;
@@ -201,8 +202,75 @@ pub async fn emit_profile_event(db: &Database, user_id: &str, event: &str, data:
 }
 
 pub async fn emit_status_event(db: &Database, user_id: &str, data: Value) {
-    crate::ws::registry::emit_to_user(user_id, "user-status-changed", data.clone());
-    emit_to_friends(db, user_id, "user-status-changed", data).await;
+    let Ok(user_oid) = ObjectId::parse_str(user_id) else {
+        log::warn!("emit_status_event received invalid user id");
+        return;
+    };
+    let user = match User::find_by_id(db, user_oid).await {
+        Ok(Some(user)) => user,
+        Ok(None) => {
+            log::warn!("emit_status_event could not find user {user_id}");
+            return;
+        }
+        Err(error) => {
+            log::error!("emit_status_event user lookup failed for {user_id}: {error}");
+            crate::ws::registry::emit_to_user(user_id, "user-status-changed", data);
+            return;
+        }
+    };
+
+    let own_status = crate::utils::user::presence::presence_payload(&user, user_id, true);
+    crate::ws::registry::emit_to_user(
+        user_id,
+        "user-status-changed",
+        json!({ "userId": user_id, "status": own_status }),
+    );
+
+    let friend_ids: HashSet<String> = match try_friend_ids(db, user_id).await {
+        Ok(ids) => ids.into_iter().collect(),
+        Err(()) => {
+            log::warn!("emit_status_event could not load friends for {user_id}");
+            HashSet::new()
+        }
+    };
+    let mut visible_recipients = Vec::new();
+    let mut hidden_recipients = Vec::new();
+    let connected_ids = crate::ws::registry::connected_user_ids().await;
+    for viewer_id in connected_ids {
+        if viewer_id == user_id {
+            continue;
+        }
+        let is_friend = friend_ids.contains(&viewer_id);
+        if crate::utils::user::presence::can_view_presence(&user, &viewer_id, is_friend) {
+            visible_recipients.push(viewer_id);
+        } else {
+            hidden_recipients.push(viewer_id);
+        }
+    }
+    if let Some(viewer_id) = visible_recipients.first() {
+        let status = crate::utils::user::presence::presence_payload(
+            &user,
+            viewer_id,
+            friend_ids.contains(viewer_id),
+        );
+        crate::ws::registry::emit_to_users(
+            &visible_recipients,
+            "user-status-changed",
+            json!({ "userId": user_id, "status": status }),
+        );
+    }
+    if let Some(viewer_id) = hidden_recipients.first() {
+        let status = crate::utils::user::presence::presence_payload(
+            &user,
+            viewer_id,
+            friend_ids.contains(viewer_id),
+        );
+        crate::ws::registry::emit_to_users(
+            &hidden_recipients,
+            "user-status-changed",
+            json!({ "userId": user_id, "status": status }),
+        );
+    }
 }
 
 pub fn map_friend_user(user: &User) -> Value {

@@ -6,3 +6,4 @@
 // Przy zmianach: json.rs.
 
 pub mod json;
+pub mod presence;

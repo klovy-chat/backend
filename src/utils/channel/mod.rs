@@ -149,8 +149,8 @@ pub async fn serialize_channel_list_item(
     }))
 }
 
-fn user_to_channel_json(user: &User) -> Value {
-    json!({
+fn user_to_channel_json(user: &User, viewer_id: &str, viewer_friends: &HashSet<ObjectId>) -> Value {
+    let mut payload = json!({
         "_id": user.id.map(|o| o.to_hex()),
         "username": user.username,
         "displayName": resolve_display_name(user),
@@ -158,9 +158,16 @@ fn user_to_channel_json(user: &User) -> Value {
         "image": user.image,
         "banner": user.banner,
         "color": user.color,
-        "isOnline": user.is_online,
-        "lastSeen": user.last_seen.as_ref().and_then(|d| d.try_to_rfc3339_string().ok()),
-    })
+    });
+    if let Some(obj) = payload.as_object_mut() {
+        let is_friend = user.id.is_some_and(|id| viewer_friends.contains(&id));
+        if let Some(status) =
+            crate::utils::user::presence::presence_payload(user, viewer_id, is_friend).as_object()
+        {
+            obj.extend(status.clone());
+        }
+    }
+    payload
 }
 
 fn user_to_channel_json_slim(user: &User) -> Value {
@@ -216,9 +223,20 @@ pub async fn fetch_users_map_slim(db: &Database, ids: &[ObjectId]) -> HashMap<Ob
     out
 }
 
-pub async fn populate_channel_user(db: &Database, id: ObjectId) -> Value {
+pub async fn populate_channel_user(db: &Database, id: ObjectId, viewer_id: &str) -> Value {
+    let viewer_friends: HashSet<ObjectId> =
+        match crate::utils::friends::try_friend_ids(db, viewer_id).await {
+            Ok(ids) => ids
+                .iter()
+                .filter_map(|id| ObjectId::parse_str(id).ok())
+                .collect(),
+            Err(()) => {
+                log::warn!("Could not load viewer friends while populating channel user");
+                HashSet::new()
+            }
+        };
     match User::find_by_id(db, id).await {
-        Ok(Some(u)) => user_to_channel_json(&u),
+        Ok(Some(u)) => user_to_channel_json(&u, viewer_id, &viewer_friends),
         Ok(None) => json!({ "_id": id.to_hex() }),
         Err(error) => {
             log::error!("Failed to load channel user {}: {error}", id.to_hex());
@@ -227,7 +245,11 @@ pub async fn populate_channel_user(db: &Database, id: ObjectId) -> Value {
     }
 }
 
-pub async fn fetch_users_map(db: &Database, ids: &[ObjectId]) -> HashMap<ObjectId, Value> {
+pub async fn fetch_users_map(
+    db: &Database,
+    ids: &[ObjectId],
+    viewer_id: &str,
+) -> HashMap<ObjectId, Value> {
     let mut seen = HashSet::new();
     let unique: Vec<ObjectId> = ids.iter().copied().filter(|id| seen.insert(*id)).collect();
     let mut out = HashMap::with_capacity(unique.len());
@@ -256,11 +278,22 @@ pub async fn fetch_users_map(db: &Database, ids: &[ObjectId]) -> HashMap<ObjectI
         }
     };
 
+    let viewer_friends: HashSet<ObjectId> =
+        match crate::utils::friends::try_friend_ids(db, viewer_id).await {
+            Ok(ids) => ids
+                .iter()
+                .filter_map(|id| ObjectId::parse_str(id).ok())
+                .collect(),
+            Err(()) => {
+                log::warn!("Could not load viewer friends while populating channel users");
+                HashSet::new()
+            }
+        };
     let mut found = HashSet::new();
     for user in &users {
         let Some(id) = user.id else { continue };
         found.insert(id);
-        out.insert(id, user_to_channel_json(user));
+        out.insert(id, user_to_channel_json(user, viewer_id, &viewer_friends));
     }
     for id in unique {
         if !found.contains(&id) {
@@ -270,13 +303,13 @@ pub async fn fetch_users_map(db: &Database, ids: &[ObjectId]) -> HashMap<ObjectI
     out
 }
 
-pub async fn fetch_users_by_refs(db: &Database, ids: &[ObjectId]) -> Vec<Value> {
+pub async fn fetch_users_by_refs(db: &Database, ids: &[ObjectId], viewer_id: &str) -> Vec<Value> {
     let mut seen = HashSet::new();
     let unique: Vec<ObjectId> = ids.iter().copied().filter(|id| seen.insert(*id)).collect();
     if unique.is_empty() {
         return Vec::new();
     }
-    let map = fetch_users_map(db, &unique).await;
+    let map = fetch_users_map(db, &unique, viewer_id).await;
     unique
         .into_iter()
         .map(|id| {
@@ -290,8 +323,9 @@ pub async fn fetch_users_by_refs(db: &Database, ids: &[ObjectId]) -> Vec<Value> 
 pub async fn get_channel_ban_mute_lists(
     db: &Database,
     channel_id: ObjectId,
+    viewer_id: &str,
 ) -> Option<(Vec<Value>, Vec<Value>)> {
-    moderation::get_channel_ban_mute_lists(db, channel_id).await
+    moderation::get_channel_ban_mute_lists(db, channel_id, viewer_id).await
 }
 
 pub async fn enrich_channel_unread(

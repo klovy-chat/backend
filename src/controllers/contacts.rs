@@ -111,8 +111,8 @@ pub struct SearchBody {
     pub search_term: Option<String>,
 }
 
-fn friend_profile_json(friend: &User) -> serde_json::Value {
-    json!({
+fn friend_profile_json(friend: &User, viewer_id: &str) -> serde_json::Value {
+    let mut profile = json!({
         "_id": friend.id.map(|o| o.to_hex()).unwrap_or_default(),
         "username": friend.username,
         "displayName": resolve_display_name(friend),
@@ -120,10 +120,15 @@ fn friend_profile_json(friend: &User) -> serde_json::Value {
         "image": friend.image,
         "banner": friend.banner,
         "color": friend.color,
-        "isOnline": friend.is_online,
-        "lastSeen": friend.last_seen.as_ref().and_then(|d| d.try_to_rfc3339_string().ok()),
         "createdAt": friend.created_at.try_to_rfc3339_string().ok(),
-    })
+    });
+    if let Some(obj) = profile.as_object_mut() {
+        let status = crate::utils::user::presence::presence_payload(friend, viewer_id, true);
+        if let Some(status) = status.as_object() {
+            obj.extend(status.clone());
+        }
+    }
+    profile
 }
 
 pub async fn get_contact_profile(req: HttpRequest) -> HttpResponse {
@@ -164,7 +169,7 @@ pub async fn get_contact_profile(req: HttpRequest) -> HttpResponse {
     };
 
     HttpResponse::Ok().json(json!({
-        "contact": friend_profile_json(&friend),
+        "contact": friend_profile_json(&friend, &user_id),
     }))
 }
 
@@ -531,7 +536,7 @@ pub async fn get_contacts_for_list(req: HttpRequest) -> HttpResponse {
             .as_ref()
             .map(|(t, _, _)| t.timestamp_millis())
             .unwrap_or(0);
-        let mut profile = friend_profile_json(friend);
+        let mut profile = friend_profile_json(friend, &user_id);
         if let Some(obj) = profile.as_object_mut() {
             obj.insert(
                 "lastMessageTime".to_string(),
