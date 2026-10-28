@@ -12,7 +12,7 @@ use super::csrf::CSRF_HEADER_NAME;
 use super::id::CLIENT_HEADER_NAME;
 use super::user_agent::CLIENT_USER_AGENT_HEADER;
 
-pub const CORS_ALLOWED_REQUEST_HEADERS: [HeaderName; 10] = [
+pub const CORS_ALLOWED_REQUEST_HEADERS: [HeaderName; 12] = [
     HeaderName::from_static("content-type"),
     HeaderName::from_static("authorization"),
     HeaderName::from_static("accept"),
@@ -23,6 +23,8 @@ pub const CORS_ALLOWED_REQUEST_HEADERS: [HeaderName; 10] = [
     HeaderName::from_static("x-client-version"),
     HeaderName::from_static(CLIENT_HEADER_NAME),
     HeaderName::from_static(CLIENT_USER_AGENT_HEADER),
+    HeaderName::from_static("x-klovy-desktop"),
+    HeaderName::from_static("x-klovy-desktop-version"),
 ];
 
 pub fn cors_allowed_request_header_names() -> &'static [&'static str] {
@@ -37,5 +39,7 @@ pub fn cors_allowed_request_header_names() -> &'static [&'static str] {
         "x-client-version",
         CLIENT_HEADER_NAME,
         CLIENT_USER_AGENT_HEADER,
+        "x-klovy-desktop",
+        "x-klovy-desktop-version",
     ]
 }

@@ -22,6 +22,7 @@ use crate::routes::{
 use crate::middlewares::{
     client::client_guard_middleware,
     csrf::csrf_middleware,
+    desktop_version::desktop_version_guard,
     ip_block::{ip_blocker_middleware, track_suspicious_activity, IPBlockerArc},
     origin::origin_guard_middleware,
     proxy::{internal_proxy_secret, proxy, INTERNAL_PROXY_HEADER},
@@ -246,6 +247,7 @@ pub fn create_app(
         .wrap(from_fn(track_suspicious_activity))
         .wrap(from_fn(global_limiter))
         .wrap(from_fn(client_guard_middleware))
+        .wrap(from_fn(desktop_version_guard))
         .wrap(from_fn(origin_guard_middleware))
         .wrap(from_fn(csrf_middleware))
         .wrap(from_fn(sanitize_input_middleware))

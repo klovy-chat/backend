@@ -11,6 +11,7 @@ pub mod auth_fallback;
 pub mod captcha;
 pub mod client;
 pub mod csrf;
+pub mod desktop_version;
 pub mod ip_block;
 pub mod origin;
 pub mod proxy;
